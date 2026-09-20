@@ -1,0 +1,13 @@
+# MLX Transcript runtime and development dependencies.
+# Apple silicon only. FFmpeg must also be installed: brew install ffmpeg
+
+PySide6>=6.6
+mlx-whisper>=0.4.1
+
+# Speaker detection (optional). Apache-2.0, ONNX Runtime, no PyTorch, no CUDA,
+# no account or access token. Transcription works without it; the Speaker
+# Detection section reports Unavailable until it is installed.
+sherpa-onnx>=1.13
+
+# Development tools are intentionally kept out of the packaged runtime.
+pytest>=8.0

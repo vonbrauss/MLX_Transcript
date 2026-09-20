@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+_backup/
+*.dmg
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editors
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+._*
+
+# Local output and media
+Transcription/
+*.mov
+*.mp4
+*.wav
