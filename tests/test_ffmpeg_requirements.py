@@ -8,8 +8,8 @@ real clip.
 
 So these tests pin three things: every component is emitted as its own flag,
 the validation actually runs a decode rather than only reading a version
-string, and the documentation and build script cannot drift from the module
-that defines the contract.
+string, and the build script and spec cannot drift from the module that
+defines the contract.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGING = PROJECT_ROOT / "packaging"
-BUILDING = PROJECT_ROOT / "docs" / "BUILDING.md"
+REQUIREMENTS = PACKAGING / "ffmpeg_requirements.py"
 SCRIPT = PROJECT_ROOT / "scripts" / "finish_release_prep.sh"
 SPEC = PROJECT_ROOT / "packaging" / "MLX_Transcript.spec"
 
@@ -364,32 +364,29 @@ def test_the_build_script_validates_after_building():
     assert "--verify" in text
 
 
-def test_the_documentation_lists_every_flag_explicitly():
-    text = BUILDING.read_text(encoding="utf-8")
-
-    for name in req.REQUIRED_ENCODERS:
-        assert f"--enable-encoder={name}" in text
-    for name in req.resolve_muxer_components().values():
-        assert f"--enable-muxer={name}" in text
-    for name in req.REQUIRED_FILTERS:
-        assert f"--enable-filter={name}" in text
+# A third test here cross-checked the flag list against docs/BUILDING.md,
+# which fe49668 removed. That check is obsolete rather than missing: the
+# per-kind tests above already pin every flag, and
+# test_the_build_script_generates_the_flags_rather_than_repeating_them stops a
+# second copy of the list appearing anywhere. The reasoning is what still
+# needs pinning, and it lives in the module that defines the contract.
 
 
-def test_the_documentation_explains_the_two_pcm_formats():
-    text = BUILDING.read_text(encoding="utf-8")
+def test_the_recipe_explains_the_two_pcm_formats():
+    """Both formats look redundant until you know which tool needs which."""
+    text = REQUIREMENTS.read_text(encoding="utf-8")
 
-    assert "Why two raw PCM formats" in text
-    assert "mlx_whisper.load_audio" in text
-    assert "speaker detection" in text
-    assert "Requested output format 's16le' is not known." in text
+    assert "load_audio" in text
+    assert "speaker-detection" in text
     assert "headerless" in text
+    assert "Requested output format 's16le' is not known." in text
+    assert [name for name, _, _ in req.PCM_OUTPUT_FORMATS] == ["s16le", "f32le"]
 
 
-def test_the_documentation_warns_against_comma_separated_flags():
-    text = BUILDING.read_text(encoding="utf-8")
-
-    assert "matches nothing" in text
-    assert "one flag per component" in text
+def test_the_recipe_documents_one_flag_per_component():
+    """The comma defect is refused in code; the reason stays next to it."""
+    assert "one flag per component" in (req.configure_arguments.__doc__ or "")
+    assert "comma-separated" in (req.__doc__ or "")
 
 
 # ------------------------------------------------- the packaging gate itself

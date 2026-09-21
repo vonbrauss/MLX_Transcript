@@ -1,4 +1,4 @@
-"""Finder drops onto the Folders drop zone and onto the Queue table.
+"""Finder drops onto the Media workspace and onto the Queue table.
 
 Drag and drop is a headline feature and had no automated coverage at all. A
 real Cocoa drag cannot be synthesised here, so these drive the window's event
@@ -70,7 +70,8 @@ def urls_for(paths: list[Path]) -> QMimeData:
 
 def drop_targets(window: MainWindow) -> dict[str, object]:
     return {
-        "folders drop zone": window.drop_target,
+        "media drop zone": window.drop_target,
+        "inline queue table": window.media_queue_table,
         "queue table": window.queue_table,
         "queue viewport": window.queue_drop_viewport,
     }
@@ -122,7 +123,7 @@ def clip(folder: Path, name: str = "clip.mov") -> Path:
 # ----------------------------------------------------------- accepting a drag
 
 
-@pytest.mark.parametrize("target_name", ["folders drop zone", "queue table", "queue viewport"])
+@pytest.mark.parametrize("target_name", ["media drop zone", "inline queue table", "queue table", "queue viewport"])
 def test_a_file_drag_is_accepted_on_every_target(window, tmp_path, target_name):
     target = drop_targets(window)[target_name]
     event = send_drag_enter(window, target, urls_for([clip(tmp_path)]))
@@ -131,7 +132,7 @@ def test_a_file_drag_is_accepted_on_every_target(window, tmp_path, target_name):
     assert target.property("dropActive") is True
 
 
-@pytest.mark.parametrize("target_name", ["folders drop zone", "queue table", "queue viewport"])
+@pytest.mark.parametrize("target_name", ["media drop zone", "inline queue table", "queue table", "queue viewport"])
 def test_a_drag_without_local_files_is_not_accepted(window, target_name):
     target = drop_targets(window)[target_name]
     mime = QMimeData()
@@ -175,7 +176,7 @@ def test_dropping_clears_the_highlight(window, application, tmp_path):
 # ------------------------------------------------------------ queueing a drop
 
 
-@pytest.mark.parametrize("target_name", ["folders drop zone", "queue table", "queue viewport"])
+@pytest.mark.parametrize("target_name", ["media drop zone", "inline queue table", "queue table", "queue viewport"])
 def test_dropping_a_file_queues_it_on_every_target(
     window, application, tmp_path, target_name
 ):

@@ -31,7 +31,6 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = PROJECT_ROOT / "packaging" / "ffmpeg_requirements.py"
 PREP = PROJECT_ROOT / "scripts" / "finish_release_prep.sh"
-BUILDING = PROJECT_ROOT / "docs" / "BUILDING.md"
 
 
 def load_requirements():
@@ -372,21 +371,24 @@ def test_the_flag_check_is_bash_3_2_compatible():
         assert feature not in body, f"{feature} is not in Bash 3.2"
 
 
-# ------------------------------------------------------------ documentation
+# ------------------------------------------- the recipe explains itself
+
+# Two tests here read docs/BUILDING.md until fe49668 removed that guide. They
+# existed to stop a prose copy of the recipe drifting from the code. There is
+# no second copy now, so what is left to pin is the reasoning, and it lives
+# beside the definitions it explains. The flags themselves are already pinned
+# by test_the_pcm_muxers_are_enabled_by_their_component_name, and the build
+# script's handling of the warning by
+# test_the_script_treats_a_did_not_match_warning_as_fatal.
 
 
-def test_the_documentation_shows_the_component_spelling():
-    text = BUILDING.read_text(encoding="utf-8")
+def test_the_recipe_explains_the_two_spellings_where_it_defines_them():
+    """Whoever edits these flags next has to be able to read why."""
+    doc = req.__doc__ or ""
 
-    assert "--enable-muxer=pcm_s16le" in text
-    assert "--enable-muxer=pcm_f32le" in text
-
-
-def test_the_documentation_explains_the_two_spellings():
-    text = BUILDING.read_text(encoding="utf-8")
-
-    assert "did not match anything" in text
-    assert "component" in text
+    assert "pcm_s16le" in doc
+    assert "did not match anything" in doc
+    assert "component" in doc
 
 
 # ------------------------------------------------------------- flag ordering

@@ -22,27 +22,35 @@ the transcript type, or add a custom suffix. Any combination of ScriptSync,
 Timecoded, SRT, and WebVTT can be produced in one pass.
 
 MLX Transcript accepts any local media file FFmpeg can read that contains an
-audio stream, whatever its filename. Folders are scanned recursively and each
+audio stream, whatever its filename. Dropped folders are scanned recursively and each
 candidate file is probed with `ffprobe` in the background, so a clip with an
 unusual extension, or none at all, is queued as long as it holds audio. A
 short list of formats that cannot carry audio, such as PDFs, images and
 subtitle files, is skipped without probing as a fast path. Anything skipped is
 counted in the queue summary with a reason, so nothing is dropped silently.
 
-Drag media files or folders onto the Folders drop area or Queue to append them.
+Drag media files or folders onto the Media workspace or Queue to append them.
+A translucent sheet marks the workspace while a Finder drag is over it.
 Duplicate files are ignored. When a queue combines multiple source roots while
 using the source-tree layout, each root receives its own output folder so
 unrelated folders cannot collide. The queue can also remove selected entries,
 clear its contents, and reveal a selected source in Finder.
 
-The window uses a single-row workspace menu for Folders, Transcription,
+The Media workspace is empty until media is queued, and then shows the queue
+inline in the same area. The Queue workspace is the same queue at full-page
+size: both read one list, so order, statuses, selection, and the summary are
+always in step. Dragging a row up or down changes the order files are
+transcribed in, and an insertion line shows where the row will land.
+Reordering is unavailable while a batch is running.
+
+The window uses a single-row workspace menu for Media, Transcription,
 Output, Speaker Detection, Advanced Settings, and Queue. Only the selected
 workspace is shown, and starting a batch opens Queue automatically while the
 progress and action bar stays visible.
 The app saves settled changes automatically and restores the last working
 setup on the next launch. Named presets store reusable transcription, output,
 and speaker settings while keeping each job's source and destination folders.
-Each launch begins on Folders. The Help workspace provides a quick guide to
+Each launch begins on Media. The Help workspace provides a quick guide to
 selecting folders, choosing output formats, speaker detection, and running a
 batch.
 The packaged entry point routes background helper processes before Qt starts

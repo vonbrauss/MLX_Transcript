@@ -42,8 +42,25 @@ def test_the_launch_size_is_wide_and_compact(application):
     built = MainWindow(AppSettings())
     try:
         assert built.size().width() == 1180
-        assert built.size().height() == 720
+        assert built.size().height() == 800
+        assert built.minimumWidth() == 940
         assert built.minimumHeight() == 560
+    finally:
+        built.close()
+
+
+def test_the_footer_is_whole_at_the_new_default_size(application):
+    """The taller launch size must not push the footer off the screen."""
+    built = MainWindow(AppSettings())
+    try:
+        built.show()
+        application.processEvents()
+        assert built.footer.isVisible()
+        assert built.progress_bar.isVisible()
+        assert built.current_file_label.isVisible()
+        assert built.start_button.isVisible()
+        bottom = built.footer.y() + built.footer.height()
+        assert bottom <= built.height() + 1
     finally:
         built.close()
 
@@ -51,7 +68,7 @@ def test_the_launch_size_is_wide_and_compact(application):
 def test_navigation_is_one_horizontal_row(window):
     assert window.section_tabs.count() == 7
     assert [window.section_tabs.tabText(index) for index in range(7)] == [
-        "Folders",
+        "Media",
         "Transcription",
         "Output",
         "Speaker Detection",
@@ -74,10 +91,22 @@ def test_the_selected_menu_is_collected_for_the_next_launch(window):
     assert window._collect_settings().selected_section == "queue"
 
 
-def test_each_launch_starts_on_folders(application):
+def test_each_launch_starts_on_media(application):
     built = MainWindow(AppSettings(selected_section="queue"))
     try:
         assert built.section_stack.currentWidget() is built.folders_group
+    finally:
+        built.close()
+
+
+def test_a_stored_folders_setting_still_opens_the_media_page(application):
+    """The settings key never changed, so an existing setup still works."""
+    built = MainWindow(AppSettings(selected_section="folders"))
+    try:
+        built._select_section("folders")
+        assert built.section_stack.currentWidget() is built.media_group
+        assert built.media_group is built.folders_group
+        assert built._collect_settings().selected_section == "folders"
     finally:
         built.close()
 
@@ -119,7 +148,7 @@ def test_every_section_aligns_its_form_labels_left_and_centred(window):
 
 def test_grid_labels_are_aligned_rather_than_stretched(window):
     """A grid stretches a label over the row unless told otherwise."""
-    layout = window.folders_group._content.layout()
+    layout = window.media_group._content.layout()
     assert isinstance(layout, QGridLayout)
 
     captions = 0
@@ -217,16 +246,16 @@ def test_the_queue_never_collapses_to_nothing(window, application):
     assert window.queue_table.minimumHeight() > 0
 
 
-# ------------------------------------------------------- the folders section
+# --------------------------------------------------------- the media section
 
 
-def test_the_folders_section_shows_one_destination_not_three(window):
+def test_the_media_section_shows_one_destination_not_three(window):
     assert window.scriptsync_preview.isVisibleTo(window.folders_group)
     assert window.timecoded_preview.isHidden()
     assert window.subtitles_preview.isHidden()
 
 
-def test_drop_target_uses_the_available_folders_workspace(window, application):
+def test_drop_target_uses_the_available_media_workspace(window, application):
     window._select_section("folders")
     application.processEvents()
     assert window.drop_target.height() > 140

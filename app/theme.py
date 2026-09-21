@@ -130,6 +130,38 @@ QFrame#dropTarget[dropActive="true"], QTableWidget[dropActive="true"] {
     background-color: #18324D;
     border: 2px solid #4C9AFF;
 }
+/* Once media is queued the workspace shows the inline queue, so the dashed
+   invitation gives way to the same surface the Queue page uses. */
+QFrame#dropTarget[mode="queue"] {
+    background-color: transparent;
+    border: none;
+}
+QStackedWidget#mediaWorkspaceStack {
+    background-color: transparent;
+    border: none;
+}
+/* The Finder-drag sheet. The tint is translucent so a loaded queue stays
+   faintly readable underneath it. */
+QFrame#dropOverlay {
+    background-color: rgba(40, 120, 208, 58);
+    border: 2px solid #4C9AFF;
+    border-radius: 7px;
+}
+QLabel[kind="dropOverlayText"] {
+    color: #EAF3FF;
+    background-color: rgba(12, 24, 40, 225);
+    border: 1px solid #4C9AFF;
+    border-radius: 11px;
+    padding: 11px 20px;
+    font-size: 17px;
+    font-weight: 650;
+}
+/* The line that shows where a dragged row will land. */
+QFrame#queueInsertIndicator {
+    background-color: #4C9AFF;
+    border: none;
+    border-radius: 1px;
+}
 
 QFrame#appFooter {
     background-color: #141920;

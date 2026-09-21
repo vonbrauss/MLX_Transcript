@@ -27,7 +27,7 @@ from app.main_window import MainWindow  # noqa: E402
 from app.settings import AppSettings  # noqa: E402
 from app.theme import apply_theme, build_style_sheet, chevron_path  # noqa: E402
 
-DEFAULT_SIZE = (1180, 720)
+DEFAULT_SIZE = (1180, 800)
 SHORT_SIZE = (1000, 560)
 OUTPUT_FOLDER = PROJECT_ROOT / "build" / "ui"
 

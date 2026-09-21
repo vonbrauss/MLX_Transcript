@@ -12,6 +12,7 @@ from PySide6.QtCore import (
     QElapsedTimer,
     QEvent,
     QObject,
+    QPoint,
     QThread,
     QTimer,
     QUrl,
@@ -20,7 +21,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLayout,
@@ -46,8 +45,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QTabBar,
-    QTableWidget,
-    QTableWidgetItem,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -65,6 +62,7 @@ from app.models import (
 )
 from app.collapsible import CollapsibleSection
 from app.power import SleepBlocker
+from app.queue_panel import QUEUE_COLUMNS as QUEUE_COLUMN_LABELS, QueuePanel
 from app.settings import (
     LANGUAGE_CHOICES,
     AppSettings,
@@ -140,6 +138,21 @@ FINISHING_TEXT = (
     "Finishing the current file, then closing. Transcripts already written are safe."
 )
 
+#: The Media workspace's empty state, unchanged from the original drop zone.
+MEDIA_EMPTY_TITLE = "Drop media files or folders here"
+MEDIA_EMPTY_HINT = "They will be added to the current queue"
+#: Shown on the translucent sheet while a Finder drag is over the workspace.
+MEDIA_DROP_OVERLAY_TEXT = "Drop to add media to the queue"
+QUEUE_EMPTY_SUMMARY = (
+    "Choose a media file or folder in Media to add it to this queue."
+)
+QUEUE_EMPTY_DROP_HINT = (
+    "Drop media files or folders here, or add them in Media."
+)
+#: Qt's own item-view drag payload. A drag carrying this and no file URLs is
+#: one of our own rows being moved, never media arriving from the Finder.
+INTERNAL_ROW_MIME = "application/x-qabstractitemmodeldatalist"
+
 
 def _set_tone(widget: QWidget, tone: str) -> None:
     """Apply a semantic text color without disabling readable content."""
@@ -190,14 +203,22 @@ class ConflictDialog(QMessageBox):
 
 
 class MainWindow(QMainWindow):
-    """Folder pickers, transcription options, and the media queue."""
+    """Media pickers, transcription options, and the media queue."""
 
-    QUEUE_COLUMNS = ("File", "Folder", "Duration", "Status")
+    QUEUE_COLUMNS = QUEUE_COLUMN_LABELS
 
     def __init__(self, settings: AppSettings | None = None) -> None:
         super().__init__()
         self.settings = settings or load_settings()
         self.items: list[QueueItem] = []
+        #: Both queue views. They are rendered from ``items`` and never from
+        #: each other, so the inline panel and the Queue page cannot disagree.
+        self._queue_panels: list[QueuePanel] = []
+        self._syncing_selection = False
+        #: Source roots in the order they were first queued. Output labels are
+        #: read from this rather than from the queue, so moving a row never
+        #: renames somebody's output folder.
+        self._root_order: list[Path] = []
         self.last_summary: BatchSummary | None = None
         # Seam for the headless harness: replace to run a batch without MLX.
         self.engine_factory: Callable[[], TranscriptionEngine] = self._build_engine
@@ -241,8 +262,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("MLX Transcript")
         self.setMinimumSize(940, 560)
-        self.resize(1180, 720)
+        self.resize(1180, 800)
         self._build_ui()
+        self._update_media_workspace()
         self._restore_settings()
         self._refresh_output_preview()
         self._update_actions()
@@ -284,6 +306,10 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(header)
 
         self.folders_group = self._build_folders_group()
+        # The page is called Media in the interface. The attribute, the
+        # settings key, and the section key keep their original names so
+        # stored settings still open on it.
+        self.media_group = self.folders_group
         self.transcription_group = self._build_options_group()
         self.output_group = self._build_output_group()
         self.speaker_group = self._build_speaker_group()
@@ -315,7 +341,7 @@ class MainWindow(QMainWindow):
             "help",
         )
         section_pages = (
-            ("Folders", self.folders_group),
+            ("Media", self.folders_group),
             ("Transcription", self.transcription_group),
             ("Output", self.output_group),
             ("Speaker Detection", self.speaker_group),
@@ -324,7 +350,7 @@ class MainWindow(QMainWindow):
             ("Help", self.help_group),
         )
         page_guidance = (
-            ("Choose your media", "Select one media file or a folder. Folders and their subfolders are scanned automatically."),
+            ("Choose your media", "Select media files or folders, or drop them below. Folders and their subfolders are scanned automatically, and you can drag queued rows to change the order."),
             ("Transcription preferences", "Choose the spoken language and a cleanup preset. Large v3 favors accuracy; Turbo favors speed."),
             ("Save your transcripts", "Choose formats, file names, and how to organize the results."),
             ("Identify speakers", "Add speaker labels, then review and rename them before saving."),
@@ -410,7 +436,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Choose a media file or folder to build the queue.")
 
     def _build_folders_group(self) -> CollapsibleSection:
-        group = CollapsibleSection("Folders")
+        group = CollapsibleSection("Media")
         grid = QGridLayout()
         group.setContentLayout(grid)
         grid.setColumnStretch(1, 1)
@@ -454,32 +480,97 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(QLabel("Transcripts saved in"), 2, 0)
         grid.addWidget(self.scriptsync_preview, 2, 1, 1, 3)
+        # The large lower area is both the drop target and the inline
+        # queue. Which one it shows depends only on whether anything is
+        # queued, so there is one place for media to land either way.
         self.drop_target = QFrame()
         self.drop_target.setObjectName("dropTarget")
+        self.drop_target.setProperty("mode", "empty")
         self.drop_target.setAcceptDrops(True)
         self.drop_target.installEventFilter(self)
         self.drop_target.setMinimumHeight(150)
+        self.drop_target.setToolTip(
+            "Drop media files or folders here to add them to the Media queue."
+        )
         self.drop_target.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        drop_layout = QVBoxLayout(self.drop_target)
+        workspace = QVBoxLayout(self.drop_target)
+        workspace.setContentsMargins(0, 0, 0, 0)
+        workspace.setSpacing(0)
+
+        empty_state = QWidget()
+        drop_layout = QVBoxLayout(empty_state)
         drop_layout.setContentsMargins(20, 20, 20, 20)
         drop_layout.setSpacing(6)
         drop_layout.addStretch(1)
-        drop_title = QLabel("Drop media files or folders here")
+        drop_title = QLabel(MEDIA_EMPTY_TITLE)
         drop_title.setProperty("kind", "dropTitle")
         drop_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        drop_hint = QLabel("They will be added to the current queue")
+        drop_hint = QLabel(MEDIA_EMPTY_HINT)
         drop_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         _set_tone(drop_hint, "secondary")
         drop_layout.addWidget(drop_title)
         drop_layout.addWidget(drop_hint)
         drop_layout.addStretch(1)
+        self.media_empty_state = empty_state
+        self.drop_title_label = drop_title
+        self.drop_hint_label = drop_hint
+
+        self.media_queue_panel = self._build_queue_panel(QUEUE_EMPTY_SUMMARY)
+        queue_page = QWidget()
+        queue_page_layout = QVBoxLayout(queue_page)
+        queue_page_layout.setContentsMargins(12, 12, 12, 12)
+        queue_page_layout.setSpacing(0)
+        queue_page_layout.addWidget(self.media_queue_panel)
+        self.media_queue_page = queue_page
+        self.media_queue_table = self.media_queue_panel.table
+        self.media_queue_summary = self.media_queue_panel.summary
+
+        self.media_stack = QStackedWidget(self.drop_target)
+        self.media_stack.setObjectName("mediaWorkspaceStack")
+        self.media_stack.addWidget(empty_state)
+        self.media_stack.addWidget(queue_page)
+        workspace.addWidget(self.media_stack)
+
+        self.media_drop_overlay = self._build_media_drop_overlay()
+
         grid.addWidget(self.drop_target, 3, 0, 1, 4)
         grid.setRowStretch(3, 1)
         self.timecoded_preview.hide()
         self.subtitles_preview.hide()
         return group
+
+    def _build_media_drop_overlay(self) -> QFrame:
+        """A translucent sheet shown over the workspace during a Finder drag.
+
+        It is transparent to the mouse, so it never becomes the drop target
+        itself, and it sits above whichever state the workspace is showing.
+        The queue stays faintly readable through it.
+        """
+        overlay = QFrame(self.drop_target)
+        overlay.setObjectName("dropOverlay")
+        overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.addStretch(1)
+        message = QLabel(MEDIA_DROP_OVERLAY_TEXT)
+        message.setProperty("kind", "dropOverlayText")
+        message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Centred on its own backing rather than stretched across the sheet,
+        # so the message stays readable over a queue row behind it.
+        centred = QHBoxLayout()
+        centred.addStretch(1)
+        centred.addWidget(message)
+        centred.addStretch(1)
+        layout.addLayout(centred)
+        layout.addStretch(1)
+        overlay.hide()
+        self.media_drop_overlay_label = message
+        return overlay
 
     def _build_options_group(self) -> CollapsibleSection:
         group = CollapsibleSection("Transcription")
@@ -910,59 +1001,23 @@ class MainWindow(QMainWindow):
         return field
 
     def _build_queue_group(self) -> CollapsibleSection:
+        """The dedicated Queue page: the same queue at full-page size."""
         group = CollapsibleSection("Queue")
         layout = QVBoxLayout()
         group.setContentLayout(layout)
 
-        self.queue_table = QTableWidget(0, len(self.QUEUE_COLUMNS))
-        self.queue_table.setMinimumHeight(90)
-        self.queue_table.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.queue_table.setHorizontalHeaderLabels(list(self.QUEUE_COLUMNS))
-        self.queue_table.verticalHeader().setVisible(False)
-        self.queue_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.queue_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.queue_table.setAlternatingRowColors(True)
-        self.queue_table.setAcceptDrops(True)
-        self.queue_table.installEventFilter(self)
-        self.queue_drop_viewport = self.queue_table.viewport()
-        self.queue_drop_viewport.setAcceptDrops(True)
-        self.queue_drop_viewport.installEventFilter(self)
-        self.queue_table.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        self.queue_table.setShowGrid(False)
-        self.queue_table.verticalHeader().setDefaultSectionSize(34)
-        header = self.queue_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.queue_panel = self._build_queue_panel(QUEUE_EMPTY_SUMMARY)
+        layout.addWidget(self.queue_panel, stretch=1)
 
-        self.queue_summary = QLabel("Choose a media file or folder in Folders to add it to this queue.")
-        _set_tone(self.queue_summary, "secondary")
-
-        actions = QHBoxLayout()
-        self.remove_selected_button = QPushButton("Remove Selected")
-        self.remove_selected_button.clicked.connect(self._remove_selected_items)
-        self.clear_queue_button = QPushButton("Clear Queue")
-        self.clear_queue_button.setProperty("kind", "danger")
-        self.clear_queue_button.clicked.connect(self._clear_queue)
-        self.reveal_source_button = QPushButton("Reveal Source")
-        self.reveal_source_button.clicked.connect(self._reveal_selected_source)
-        actions.addWidget(self.remove_selected_button)
-        actions.addWidget(self.clear_queue_button)
-        actions.addWidget(self.reveal_source_button)
-        actions.addStretch(1)
-        self.queue_table.itemSelectionChanged.connect(self._on_queue_selection_changed)
-
-        layout.addLayout(actions)
-        layout.addWidget(self.queue_table, stretch=1)
-        layout.addWidget(self.queue_summary)
+        # The full-page table has always been reached through these names.
+        # The inline panel is a second view onto the same queue rather than a
+        # replacement, so they keep pointing here.
+        self.queue_table = self.queue_panel.table
+        self.queue_drop_viewport = self.queue_panel.table.viewport()
+        self.queue_summary = self.queue_panel.summary
+        self.remove_selected_button = self.queue_panel.remove_button
+        self.clear_queue_button = self.queue_panel.clear_button
+        self.reveal_source_button = self.queue_panel.reveal_button
         return group
 
     def _build_help_group(self) -> CollapsibleSection:
@@ -983,11 +1038,14 @@ class MainWindow(QMainWindow):
         help_text.setHtml(
             "<h2>Getting started</h2>"
             "<ol>"
-            "<li>Open <b>Folders</b> and add media with the buttons, or drag files and folders into the drop area. "
+            "<li>Open <b>Media</b> and add media with the buttons, or drag files and folders into the drop area. "
             "MLX Transcript accepts any local media file FFmpeg can read that contains audio, whatever its "
             "filename, and reports anything it had to skip.</li>"
             "<li>Choose a destination under <b>Save transcripts to</b>. The app creates a Transcription folder there.</li>"
-            "<li>Review, remove, or clear files in <b>Queue</b>. Multiple folders stay separate in the output tree.</li>"
+            "<li>Review, reorder, remove, or clear files in <b>Media</b> or <b>Queue</b>. "
+            "Both show the same queue, so a change in one appears in the other. "
+            "Drag a row up or down to change the order files run in. "
+            "Multiple folders stay separate in the output tree.</li>"
             "<li>Choose your Whisper model and cleanup preset in <b>Transcription</b>.</li>"
             "<li>Use <b>Save as New</b> to keep a working setup as a named preset.</li>"
             "<li>Choose filename, folder, and format options in <b>Output</b>.</li>"
@@ -1479,7 +1537,7 @@ class MainWindow(QMainWindow):
             self._update_actions()
             return
         roots = output_roots(parent)
-        # One concise destination in the Folders section. The exact per-format
+        # One concise destination in the Media section. The exact per-format
         # folders are in the tooltip and repeated in the Output section, so
         # three long paths no longer take three rows of vertical space.
         self.scriptsync_preview.setText(str(roots.transcription))
@@ -1677,7 +1735,7 @@ class MainWindow(QMainWindow):
     def _on_found_files(self, total: int) -> None:
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(0)
-        self.queue_summary.setText(f"Adding {total} media file(s)…")
+        self._set_queue_summary(f"Adding {total} media file(s)…")
 
     def _add_item(self, item: QueueItem) -> bool:
         """Append one scanned item unless its source is already queued.
@@ -1690,6 +1748,9 @@ class MainWindow(QMainWindow):
         if identity in self._queued_identities:
             return False
         self._queued_identities.add(identity)
+        root = item.resolved_root_identity
+        if root not in self._root_order:
+            self._root_order.append(root)
         self.items.append(item)
         self._append_row(item)
         return True
@@ -1728,8 +1789,7 @@ class MainWindow(QMainWindow):
         if failures:
             summary += f" {failures} could not be read."
         summary += self._skipped_summary()
-        self.queue_summary.setText(summary)
-        self.queue_summary.setToolTip(self._skipped_detail())
+        self._set_queue_summary(summary, self._skipped_detail())
         if not items and self._scan_sources:
             # The folder was readable, it simply held nothing this application
             # can transcribe. Saying which folder is what makes that useful.
@@ -1756,54 +1816,119 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------------- queue
 
-    def _append_row(self, item: QueueItem) -> None:
-        row = self.queue_table.rowCount()
-        self.queue_table.insertRow(row)
-        for column in range(len(self.QUEUE_COLUMNS)):
-            self.queue_table.setItem(row, column, QTableWidgetItem(""))
-        self._refresh_row(row, item)
+    def _build_queue_panel(self, summary_text: str) -> QueuePanel:
+        """Create one view onto the queue and wire it to the shared state."""
+        panel = QueuePanel(summary_text, self)
+        panel.table.installEventFilter(self)
+        panel.table.viewport().installEventFilter(self)
+        panel.table.itemSelectionChanged.connect(
+            lambda bound=panel: self._on_panel_selection_changed(bound)
+        )
+        panel.remove_button.clicked.connect(self._remove_selected_items)
+        panel.clear_button.clicked.connect(self._clear_queue)
+        panel.reveal_button.clicked.connect(self._reveal_selected_source)
+        self._queue_panels.append(panel)
+        return panel
 
-    def _refresh_row(self, row: int, item: QueueItem) -> None:
+    def _append_row(self, item: QueueItem) -> None:
+        for panel in self._queue_panels:
+            panel.append_row()
+        self._refresh_row(len(self.items) - 1, item)
+        self._update_media_workspace()
+
+    def _row_values(self, item: QueueItem) -> tuple[str, str, str, str]:
         root_label = str(item.extras.get("queue_root_label", ""))
         folder = item.relative_folder_label
         if root_label:
             folder = root_label if folder == "/" else f"{root_label} / {folder}"
-        values = (
-            item.name,
-            folder,
-            item.duration_label,
-            item.status_label,
-        )
-        for column, value in enumerate(values):
-            cell = self.queue_table.item(row, column)
-            if cell is None:
-                cell = QTableWidgetItem("")
-                self.queue_table.setItem(row, column, cell)
-            cell.setText(value)
-            if column == 2:
-                cell.setTextAlignment(
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-                )
-            cell.setToolTip(str(item.source) if column == 0 else value)
+        return (item.name, folder, item.duration_label, item.status_label)
+
+    def _refresh_row(self, row: int, item: QueueItem) -> None:
+        values = self._row_values(item)
+        for panel in self._queue_panels:
+            panel.set_row(row, values, str(item.source))
+
+    def _rebuild_queue_rows(self, select: list[int] | None = None) -> None:
+        """Redraw both views from ``items`` after the queue itself changed."""
+        for panel in self._queue_panels:
+            panel.set_row_count(len(self.items))
+        for row, item in enumerate(self.items):
+            self._refresh_row(row, item)
+        self._update_media_workspace()
+        if select is not None:
+            self._set_selected_queue_rows(select)
+
+    def _update_media_workspace(self) -> None:
+        """Swap the Media workspace between its empty state and the queue."""
+        stack = getattr(self, "media_stack", None)
+        if stack is None:
+            return
+        loaded = bool(self.items)
+        stack.setCurrentIndex(1 if loaded else 0)
+        self.drop_target.setProperty("mode", "queue" if loaded else "empty")
+        style = self.drop_target.style()
+        style.unpolish(self.drop_target)
+        style.polish(self.drop_target)
+
+    @property
+    def media_queue_is_loaded(self) -> bool:
+        """True when the Media workspace is showing the inline queue."""
+        stack = getattr(self, "media_stack", None)
+        return stack is not None and stack.currentIndex() == 1
+
+    # ----------------------------------------------------- queue selection
+
+    def _selected_queue_rows(self) -> list[int]:
+        """The selected rows, which both views agree on."""
+        for panel in self._queue_panels:
+            rows = panel.selected_rows()
+            if rows:
+                return rows
+        return []
+
+    def _set_selected_queue_rows(self, rows: list[int]) -> None:
+        self._syncing_selection = True
+        try:
+            for panel in self._queue_panels:
+                panel.select_rows(rows)
+        finally:
+            self._syncing_selection = False
+        self._on_queue_selection_changed()
+
+    def _on_panel_selection_changed(self, panel: QueuePanel) -> None:
+        """Mirror one view's selection onto the other, then update actions."""
+        if self._syncing_selection:
+            return
+        rows = panel.selected_rows()
+        self._syncing_selection = True
+        try:
+            for other in self._queue_panels:
+                if other is not panel:
+                    other.select_rows(rows)
+        finally:
+            self._syncing_selection = False
+        self._on_queue_selection_changed()
 
     @Slot()
     def _on_queue_selection_changed(self) -> None:
-        selected = bool(self.queue_table.selectionModel().selectedRows())
+        selected = any(panel.selected_rows() for panel in self._queue_panels)
         enabled = selected and not self.is_transcribing
-        self.remove_selected_button.setEnabled(enabled)
-        self.reveal_source_button.setEnabled(enabled)
+        for panel in self._queue_panels:
+            panel.remove_button.setEnabled(enabled)
+            panel.reveal_button.setEnabled(enabled)
+
+    # --------------------------------------------------------- queue edits
 
     @Slot()
     def _remove_selected_items(self) -> None:
-        rows = sorted(
-            (index.row() for index in self.queue_table.selectionModel().selectedRows()),
-            reverse=True,
-        )
+        if self.is_transcribing:
+            return
+        rows = sorted(self._selected_queue_rows(), reverse=True)
         for row in rows:
             if 0 <= row < len(self.items):
                 del self.items[row]
-                self.queue_table.removeRow(row)
         self._rebuild_queue_index()
+        self._rebuild_queue_rows(select=[])
         self._refresh_queue_summary()
         self._update_actions()
 
@@ -1812,10 +1937,52 @@ class MainWindow(QMainWindow):
         if self.is_transcribing:
             return
         self.items.clear()
-        self.queue_table.setRowCount(0)
         self._rebuild_queue_index()
+        self._rebuild_queue_rows(select=[])
         self._refresh_queue_summary()
         self._update_actions()
+
+    def _move_queue_rows(self, rows, target: int) -> bool:
+        """Move ``rows`` so they sit immediately before ``target``.
+
+        ``items`` is the authoritative order, so it is what moves. Both views
+        are redrawn from it and the batch reads it directly, which is how a
+        reorder reaches transcription without a second list to keep in step.
+        """
+        if self.is_transcribing:
+            return False
+        moving_rows = sorted(
+            {int(row) for row in rows if 0 <= int(row) < len(self.items)}
+        )
+        if not moving_rows:
+            return False
+        target = max(0, min(int(target), len(self.items)))
+        moving = [self.items[row] for row in moving_rows]
+        chosen = set(moving_rows)
+        remaining = [
+            item for row, item in enumerate(self.items) if row not in chosen
+        ]
+        insert_at = target - sum(1 for row in moving_rows if row < target)
+        reordered = remaining[:insert_at] + moving + remaining[insert_at:]
+        if all(new is old for new, old in zip(reordered, self.items)):
+            return False
+
+        self.items = reordered
+        # Identities and source roots travel with their items, so a move
+        # changes neither duplicate detection nor where anything is written.
+        self._rebuild_queue_index()
+        self._rebuild_queue_rows(
+            select=list(range(insert_at, insert_at + len(moving)))
+        )
+        self._refresh_queue_summary()
+        self._update_actions()
+        names = ", ".join(item.name for item in moving[:3])
+        if len(moving) > 3:
+            names += ", …"
+        self.statusBar().showMessage(
+            f"Moved {names} to position {insert_at + 1} in the Media queue."
+        )
+        return True
 
     def _rebuild_queue_index(self) -> None:
         """Recompute the duplicate index after the user edits the queue.
@@ -1826,89 +1993,219 @@ class MainWindow(QMainWindow):
         resolved, so it stays proportional to the queue.
         """
         self._queued_identities = {item.resolved_identity for item in self.items}
-        roots: list[Path] = []
+        self._root_order = self._ordered_roots()
+        self._queued_roots = list(self._root_order)
+
+    def _ordered_roots(self) -> list[Path]:
+        """Source roots in first-queued order, which a reorder never changes."""
+        present = {item.resolved_root_identity for item in self.items}
+        ordered = [root for root in self._root_order if root in present]
         for item in self.items:
             root = item.resolved_root_identity
-            if root not in roots:
-                roots.append(root)
-        self._queued_roots = roots
+            if root not in ordered:
+                ordered.append(root)
+        return ordered
+
+    @staticmethod
+    def _labels_for_roots(roots: list[Path]) -> dict[Path, str]:
+        """Give same-named source roots distinguishing labels."""
+        used: dict[str, int] = {}
+        labels: dict[Path, str] = {}
+        for root in roots:
+            base = root.name or "Files"
+            used[base] = used.get(base, 0) + 1
+            labels[root] = base if used[base] == 1 else f"{base} ({used[base]})"
+        return labels
 
     @Slot()
     def _reveal_selected_source(self) -> None:
-        rows = self.queue_table.selectionModel().selectedRows()
+        rows = self._selected_queue_rows()
         if not rows:
             return
-        source = self.items[rows[0].row()].source
+        source = self.items[rows[0]].source
         if sys.platform == "darwin":
             subprocess.run(["open", "-R", str(source)], check=False)
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(source.parent)))
+
+    # ------------------------------------------------------- queue summary
+
+    def _set_queue_summary(self, text: str, tooltip: str | None = None) -> None:
+        """One summary, shown identically in both views."""
+        for panel in self._queue_panels:
+            panel.summary.setText(text)
+            if tooltip is not None:
+                panel.summary.setToolTip(tooltip)
 
     def _refresh_queue_summary(self) -> None:
         self._refresh_queue_source_labels()
         total = len(self.items)
         seconds = sum(item.duration_seconds or 0.0 for item in self.items)
         if not total:
-            self.queue_summary.setText(
-                "Drop media files or folders here, or add them in Folders."
-            )
+            self._set_queue_summary(QUEUE_EMPTY_DROP_HINT)
             return
         failures = sum(1 for item in self.items if item.status is QueueStatus.FAILED)
         summary = f"{total} media file(s), {format_duration(seconds)} of runtime."
         if failures:
             summary += f" {failures} could not be read."
-        self.queue_summary.setText(summary)
+        self._set_queue_summary(summary)
 
     def _refresh_queue_source_labels(self) -> None:
-        roots: list[Path] = []
-        for item in self.items:
-            root = item.resolved_root_identity
-            if root not in roots:
-                roots.append(root)
-        labels: dict[Path, str] = {}
-        if len(roots) > 1:
-            used: dict[str, int] = {}
-            for root in roots:
-                base = root.name or "Files"
-                used[base] = used.get(base, 0) + 1
-                labels[root] = base if used[base] == 1 else f"{base} ({used[base]})"
+        roots = self._ordered_roots()
+        labels = self._labels_for_roots(roots) if len(roots) > 1 else {}
         for row, item in enumerate(self.items):
             item.extras["queue_root_label"] = labels.get(
                 item.resolved_root_identity, ""
             )
-            if row < self.queue_table.rowCount():
-                self._refresh_row(row, item)
+            self._refresh_row(row, item)
+
+    # ------------------------------------------------------- drag and drop
+
+    def _panel_for_widget(self, watched: object) -> QueuePanel | None:
+        for panel in self._queue_panels:
+            if watched is panel.table or watched is panel.table.viewport():
+                return panel
+        return None
+
+    @staticmethod
+    def _is_external_media_drag(mime: object) -> bool:
+        """A Finder drag carries local file URLs; a row being moved does not."""
+        return bool(
+            mime is not None
+            and mime.hasUrls()
+            and any(url.isLocalFile() for url in mime.urls())
+        )
+
+    @staticmethod
+    def _is_internal_row_drag(mime: object) -> bool:
+        """True for one of our own rows on the move, and nothing else."""
+        return bool(
+            mime is not None
+            and not mime.hasUrls()
+            and mime.hasFormat(INTERNAL_ROW_MIME)
+        )
+
+    def _set_drop_highlight(self, widget, active: bool) -> None:
+        widget.setProperty("dropActive", bool(active))
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _is_media_workspace(self, watched, panel: QueuePanel | None) -> bool:
+        return watched is getattr(self, "drop_target", None) or (
+            panel is not None
+            and panel is getattr(self, "media_queue_panel", None)
+        )
+
+    def _show_media_drop_overlay(self) -> None:
+        overlay = getattr(self, "media_drop_overlay", None)
+        if overlay is None:
+            return
+        self._resize_media_drop_overlay()
+        overlay.show()
+        overlay.raise_()
+
+    def _hide_media_drop_overlay(self) -> None:
+        overlay = getattr(self, "media_drop_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+
+    def _resize_media_drop_overlay(self) -> None:
+        overlay = getattr(self, "media_drop_overlay", None)
+        if overlay is not None:
+            overlay.setGeometry(self.drop_target.rect())
+
+    @property
+    def media_drop_overlay_visible(self) -> bool:
+        overlay = getattr(self, "media_drop_overlay", None)
+        return overlay is not None and not overlay.isHidden()
+
+    @staticmethod
+    def _drag_position(event, panel: QueuePanel, watched) -> QPoint:
+        """Put a drag position into the table's viewport coordinates."""
+        point = event.position().toPoint()
+        if watched is panel.table:
+            point = panel.table.viewport().mapFrom(panel.table, point)
+        return point
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
-        """Accept Finder drops on the add-media target and the queue itself."""
-        drop_target = getattr(self, "drop_target", None)
-        queue_table = getattr(self, "queue_table", None)
-        queue_viewport = getattr(self, "queue_drop_viewport", None)
-        if watched in (drop_target, queue_table, queue_viewport) and watched is not None:
-            if event.type() == QEvent.Type.DragEnter:
-                mime = event.mimeData()
-                if mime.hasUrls() and any(url.isLocalFile() for url in mime.urls()):
-                    event.acceptProposedAction()
-                    watched.setProperty("dropActive", True)
-                    watched.style().unpolish(watched)
-                    watched.style().polish(watched)
+        """Route Finder drops, internal row moves, and workspace resizes."""
+        if (
+            watched is getattr(self, "drop_target", None)
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._resize_media_drop_overlay()
+        panel = self._panel_for_widget(watched)
+        if panel is not None or watched is getattr(self, "drop_target", None):
+            handled = self._handle_drag_event(watched, panel, event)
+            if handled is not None:
+                return handled
+        return super().eventFilter(watched, event)
+
+    def _handle_drag_event(
+        self, watched, panel: QueuePanel | None, event: QEvent
+    ) -> bool | None:
+        """Handle one drag event, or return None to let Qt have it."""
+        kind = event.type()
+        if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            mime = event.mimeData()
+            if self._is_external_media_drag(mime):
+                event.acceptProposedAction()
+                self._set_drop_highlight(watched, True)
+                if self._is_media_workspace(watched, panel):
+                    self._show_media_drop_overlay()
+                if panel is not None:
+                    panel.hide_insertion()
+                return True
+            if panel is not None and self._is_internal_row_drag(mime):
+                # An internal move is not media arriving, so the overlay stays
+                # down and the insertion line is the only feedback.
+                self._hide_media_drop_overlay()
+                self._set_drop_highlight(watched, False)
+                if self.is_transcribing or not panel.reorder_enabled:
+                    event.ignore()
                     return True
-            elif event.type() == QEvent.Type.DragLeave:
-                watched.setProperty("dropActive", False)
-                watched.style().unpolish(watched)
-                watched.style().polish(watched)
-            elif event.type() == QEvent.Type.Drop:
+                event.acceptProposedAction()
+                panel.show_insertion_at(
+                    panel.insertion_row_at(
+                        self._drag_position(event, panel, watched)
+                    )
+                )
+                return True
+            return None
+        if kind == QEvent.Type.DragLeave:
+            self._set_drop_highlight(watched, False)
+            self._hide_media_drop_overlay()
+            if panel is not None:
+                panel.hide_insertion()
+            return None
+        if kind == QEvent.Type.Drop:
+            mime = event.mimeData()
+            self._set_drop_highlight(watched, False)
+            self._hide_media_drop_overlay()
+            if self._is_external_media_drag(mime):
+                if panel is not None:
+                    panel.hide_insertion()
                 paths = [
-                    Path(url.toLocalFile()) for url in event.mimeData().urls()
+                    Path(url.toLocalFile())
+                    for url in mime.urls()
                     if url.isLocalFile()
                 ]
-                watched.setProperty("dropActive", False)
-                watched.style().unpolish(watched)
-                watched.style().polish(watched)
                 self._queue_sources(paths)
                 event.acceptProposedAction()
                 return True
-        return super().eventFilter(watched, event)
+            if panel is not None and self._is_internal_row_drag(mime):
+                target = panel.insertion_row
+                if target is None:
+                    target = panel.insertion_row_at(
+                        self._drag_position(event, panel, watched)
+                    )
+                panel.hide_insertion()
+                if not self.is_transcribing and panel.reorder_enabled:
+                    self._move_queue_rows(self._selected_queue_rows(), target)
+                event.acceptProposedAction()
+                return True
+            return None
+        return None
 
     def _set_item_status(self, row: int, status: QueueStatus, message: str = "") -> None:
         if not 0 <= row < len(self.items):
@@ -1933,21 +2230,16 @@ class MainWindow(QMainWindow):
         return SherpaOnnxDiarizer(cache=self.model_cache)
 
     def _batch_root_labels(self, rows: list[int]) -> dict[Path, str | None]:
-        """Keep mixed source trees separate without changing file names."""
-        roots = []
-        for row in rows:
-            root = self.items[row].resolved_root_identity
-            if root not in roots:
-                roots.append(root)
+        """Keep mixed source trees separate without changing file names.
+
+        The labels follow the order roots were first queued rather than the
+        current row order, so dragging a row never renames an output folder.
+        """
+        wanted = {self.items[row].resolved_root_identity for row in rows}
+        roots = [root for root in self._ordered_roots() if root in wanted]
         if len(roots) <= 1:
             return {root: None for root in roots}
-        used: dict[str, int] = {}
-        labels: dict[Path, str | None] = {}
-        for root in roots:
-            base = root.name or "Files"
-            used[base] = used.get(base, 0) + 1
-            labels[root] = base if used[base] == 1 else f"{base} ({used[base]})"
-        return labels
+        return dict(self._labels_for_roots(roots))
 
     # --------------------------------------------------------- speaker setup
 
@@ -2513,7 +2805,7 @@ class MainWindow(QMainWindow):
             if not ready:
                 hint = "Choose a media file or folder to begin."
             elif self.output_parent is None:
-                hint = "Choose where to save your transcripts in Folders."
+                hint = "Choose where to save your transcripts in Media."
             else:
                 hint = f"Ready to transcribe {len(ready)} file{'s' if len(ready) != 1 else ''}."
             self.current_file_label.setText(hint)
@@ -2524,7 +2816,10 @@ class MainWindow(QMainWindow):
         )
         self.cancel_button.setEnabled(busy)
         self.reveal_button.setEnabled(self.output_parent is not None)
-        self.clear_queue_button.setEnabled(bool(self.items) and not busy)
+        for panel in self._queue_panels:
+            panel.clear_button.setEnabled(bool(self.items) and not busy)
+            # Reordering edits the queue, so it is off while a batch runs.
+            panel.set_reorder_enabled(not transcribing)
         self._on_queue_selection_changed()
 
         for widget in (

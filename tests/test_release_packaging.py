@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEC = PROJECT_ROOT / "packaging" / "MLX_Transcript.spec"
 BUILD_SCRIPT = PROJECT_ROOT / "scripts" / "build_macos.sh"
 README = PROJECT_ROOT / "README.md"
-BUILDING = PROJECT_ROOT / "docs" / "BUILDING.md"
+PREP_SCRIPT = PROJECT_ROOT / "scripts" / "finish_release_prep.sh"
 NOTICES = PROJECT_ROOT / "THIRD_PARTY_NOTICES.md"
 
 
@@ -269,13 +269,25 @@ def test_the_readme_says_the_packaged_app_needs_no_python(readme_text):
     assert "Nothing else" in section
 
 
-def test_the_building_guide_covers_the_lgpl_recipe():
-    text = BUILDING.read_text(encoding="utf-8")
+# docs/BUILDING.md carried this checklist until fe49668 removed it. Three of
+# its five items are already checked against the artifacts that own them:
+# MLX_TRANSCRIPT_FFMPEG by test_the_spec_can_be_pointed_at_a_specific_ffmpeg,
+# sequesterRsrc by test_the_archive_sequesters_resource_forks, and the GPL
+# flags by test_the_recipe_disables_gpl_and_nonfree. The two that lived only in the guide are
+# pinned here, against the notices a user reads and the script that runs.
+
+
+def test_the_notices_name_the_lgpl_configure_flags():
+    """The licence claim has to name what the build actually did."""
+    text = NOTICES.read_text(encoding="utf-8")
 
     assert "--disable-gpl" in text
     assert "--disable-nonfree" in text
-    assert "MLX_TRANSCRIPT_FFMPEG" in text
-    assert "sequesterRsrc" in text
+
+
+def test_the_release_prep_records_the_model_digests():
+    text = PREP_SCRIPT.read_text(encoding="utf-8")
+
     assert "record_model_digests" in text
 
 
