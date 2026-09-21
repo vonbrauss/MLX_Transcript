@@ -97,9 +97,7 @@ landed inside the bundle, re-checks the code signature on the extracted copy,
 runs the bundled `ffmpeg` and `ffprobe`, and runs the packaged engine check
 against a real MLX computation.
 
-Preview builds are ad hoc signed and are not notarized. See
-`docs/BUILDING.md` for signing and FFmpeg distribution details, and
-"Opening a preview build" below for what a downloader has to do.
+Preview builds are ad hoc signed and are not notarized. See "Opening a preview build" below for what a downloader has to do.
 
 ## Opening a preview build
 
