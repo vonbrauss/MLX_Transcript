@@ -152,25 +152,40 @@ source, asks that tree's own `configure --list-muxers`, and generates the
 flags from the answer, so the recipe cannot be wrong about a tree it is
 actually looking at.
 
-### The three gates before a single object file is compiled
+### The four gates before a single object file is compiled
 
 `configure` exits 0 whether or not it understood your flags, so the build
-checks three things itself:
+checks four things itself:
 
 1. **Every flag is well formed.** Each one begins with exactly `--` and
    carries no backslash. A flag arriving as `\--enable-muxer=pcm_s16le` is
    accepted by `configure` and ignored, so the script refuses to run
    `configure` at all if it sees one, and it compares the loaded arguments
    byte-for-byte against `build/ffmpeg-configure-args.txt`.
-2. **`configure`'s own output is read back.** The generated
-   `ffbuild/config.h` has to say `#define CONFIG_PCM_S16LE_MUXER 1` for every
-   required muxer. This is the check the first build had no equivalent of: it
-   noticed nothing, compiled for forty minutes, installed, and only the first
-   real clip revealed the muxers were missing.
-3. **Any `did not match anything` warning is fatal.** One ignored flag stops
+2. **The flags are in an order that does not cancel itself.** `configure`
+   applies options in the order it reads them, so `--disable-muxers` has to
+   come before every `--enable-muxer=`; the same for encoders and filters. The
+   check runs on the argument array that is about to be expanded into
+   `./configure`, not on the recorded file, because the array is what
+   `configure` receives.
+3. **`configure`'s own output is read back.** Every required encoder, muxer
+   and filter has to appear as `1` in the generated header: `#define
+   CONFIG_PCM_S16LE_MUXER 1`, `#define CONFIG_PCM_S16LE_ENCODER 1`,
+   `#define CONFIG_ARESAMPLE_FILTER 1`, and so on. This is the check the first
+   build had no equivalent of: it noticed nothing, compiled for forty minutes,
+   installed, and only the first real clip revealed the muxers were missing.
+
+   FFmpeg 5.1 moved those per-component defines out of `config.h` into
+   `config_components.h`, so all four candidate paths are read and merged:
+   `config_components.h`, `ffbuild/config_components.h`, `config.h`,
+   `ffbuild/config.h`. Reading only `config.h` on a modern tree finds the
+   file, finds none of the defines, and reports every component disabled
+   including `null`, which has no dependencies and cannot plausibly be off.
+   A gate that says `null` is disabled is reading the wrong file.
+4. **Any `did not match anything` warning is fatal.** One ignored flag stops
    the build rather than scrolling past.
 
-Run the second gate by hand against an already-configured tree with:
+Run the third gate by hand against an already-configured tree with:
 
 ```bash
 python3 packaging/ffmpeg_requirements.py --check-configured <ffmpeg source tree>

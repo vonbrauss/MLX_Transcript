@@ -226,6 +226,60 @@ assert_configure_args_are_clean() {
         > build/ffmpeg-configure-args.check.txt
     cmp -s build/ffmpeg-configure-args.txt build/ffmpeg-configure-args.check.txt \
         || fail "The loaded flags differ from build/ffmpeg-configure-args.txt. See build/ffmpeg-configure-args.check.txt"
+
+    assert_disables_precede_enables
+}
+
+assert_disables_precede_enables() {
+    # Checked on the array that is about to be expanded into ./configure, not
+    # on the recorded file, because the array is what configure actually
+    # receives. configure applies options in the order it reads them, so a
+    # --disable-muxers sitting after --enable-muxer=pcm_s16le would undo it
+    # without a word of complaint.
+    #
+    # Two plain arrays instead of one associative array, which is Bash 4.
+    broad_flags="--disable-encoders --disable-muxers --disable-filters"
+    out_of_order=0
+
+    for broad in $broad_flags; do
+        case "$broad" in
+            --disable-encoders) selective="--enable-encoder=" ;;
+            --disable-muxers)   selective="--enable-muxer=" ;;
+            *)                  selective="--enable-filter=" ;;
+        esac
+
+        broad_at=-1
+        index=0
+        while [ "$index" -lt "${#configure_args[@]}" ]; do
+            [ "${configure_args[$index]}" = "$broad" ] && { broad_at="$index"; break; }
+            index=$((index + 1))
+        done
+        [ "$broad_at" -ge 0 ] || continue
+
+        index=0
+        while [ "$index" -lt "$broad_at" ]; do
+            case "${configure_args[$index]}" in
+                "$selective"*)
+                    printf '!!! %s at position %s comes after %s at position %s; it would undo it\n' \
+                        "$broad" "$broad_at" "${configure_args[$index]}" "$index" >&2
+                    out_of_order=1
+                    ;;
+            esac
+            index=$((index + 1))
+        done
+    done
+
+    if [ "$out_of_order" -ne 0 ]; then
+        printf '\n'
+        printf '    the order configure would receive:\n' >&2
+        index=0
+        while [ "$index" -lt "${#configure_args[@]}" ]; do
+            printf '      %2s %s\n' "$index" "${configure_args[$index]}" >&2
+            index=$((index + 1))
+        done
+        fail "The configure flags are in an order that cancels itself."
+    fi
+
 }
 
 stage_validate_ffmpeg() {
@@ -293,11 +347,11 @@ stage_ffmpeg() {
     # config.h. This is the gate the last build had no equivalent of: it
     # noticed nothing, compiled for 40 minutes, installed, and only the first
     # real clip revealed the muxers were missing.
-    log "Confirming the required muxers were enabled before compiling"
+    log "Confirming the required encoders, muxers and filters were enabled"
     "$(python_bin)" "$requirements" --check-configured "$tree" \
-        2>&1 | tee build/ffmpeg-configured-muxers.txt
-    grep -q 'Safe to compile' build/ffmpeg-configured-muxers.txt \
-        || fail "configure did not enable the required muxers. See build/ffmpeg-configured-muxers.txt"
+        2>&1 | tee build/ffmpeg-configured-components.txt
+    grep -q 'Safe to compile' build/ffmpeg-configured-components.txt \
+        || fail "configure did not enable everything required. See build/ffmpeg-configured-components.txt"
 
     if grep -q 'did not match anything' build/ffmpeg-configure.log; then
         printf '\n'

@@ -238,17 +238,13 @@ def run_cli(*arguments: str) -> subprocess.CompletedProcess:
 
 
 def test_the_check_passes_when_configure_really_enabled_them(tmp_path):
-    tree = fake_source_tree(
-        tmp_path,
-        "pcm_s16le pcm_f32le wav null",
-        {"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
-    )
+    tree = complete_tree(tmp_path)
 
     result = run_cli("--check-configured", str(tree))
 
     assert result.returncode == 0, result.stderr
     assert "Safe to compile" in result.stdout
-    assert "s16le muxer enabled as pcm_s16le" in result.stdout
+    assert "muxer s16le enabled as pcm_s16le" in result.stdout
 
 
 def test_the_check_fails_before_compilation_when_a_muxer_is_off(tmp_path):
@@ -391,3 +387,266 @@ def test_the_documentation_explains_the_two_spellings():
 
     assert "did not match anything" in text
     assert "component" in text
+
+
+# ------------------------------------------------------------- flag ordering
+
+
+def test_the_broad_disables_come_before_every_selective_enable():
+    """configure applies options in order, so a late disable undoes them."""
+    flags = req.configure_arguments()
+
+    for broad, selective in req.BROAD_DISABLE_FLAGS:
+        assert broad in flags, f"{broad} is missing from the recipe"
+        broad_at = flags.index(broad)
+        for position, flag in enumerate(flags):
+            if flag.startswith(selective):
+                assert position > broad_at, (
+                    f"{flag} at {position} comes before {broad} at "
+                    f"{broad_at}, which would undo it"
+                )
+
+
+@pytest.mark.parametrize(
+    "broad,selective",
+    [
+        ("--disable-encoders", "--enable-encoder=pcm_s16le"),
+        ("--disable-muxers", "--enable-muxer=pcm_s16le"),
+        ("--disable-filters", "--enable-filter=aresample"),
+    ],
+)
+def test_a_broad_disable_after_its_enable_is_rejected(broad, selective):
+    with pytest.raises(req.MediaToolError) as caught:
+        req.assert_disables_precede_enables(["--disable-gpl", selective, broad])
+
+    message = str(caught.value)
+    assert broad in message
+    assert selective in message
+    assert "undo" in message
+
+
+def test_the_correct_order_passes_the_check():
+    req.assert_disables_precede_enables(
+        ["--disable-muxers", "--enable-muxer=pcm_s16le", "--enable-muxer=wav"]
+    )
+
+
+def test_a_recipe_without_the_broad_disable_is_not_flagged():
+    """Nothing to undo, so nothing to complain about."""
+    req.assert_disables_precede_enables(["--enable-muxer=pcm_s16le"])
+
+
+def test_every_broad_disable_is_paired_with_its_selective_prefix():
+    assert req.BROAD_DISABLE_FLAGS == (
+        ("--disable-encoders", "--enable-encoder="),
+        ("--disable-muxers", "--enable-muxer="),
+        ("--disable-filters", "--enable-filter="),
+    )
+
+
+def test_generating_the_flags_runs_the_order_check_itself():
+    """configure_arguments must not be able to return a cancelling order."""
+    source = REQUIREMENTS.read_text(encoding="utf-8")
+    body = source.split("def configure_arguments(", 1)[1].split("\ndef ", 1)[0]
+
+    assert "assert_disables_precede_enables(arguments)" in body
+
+
+def test_the_script_checks_the_order_of_the_array_not_the_file():
+    text = PREP.read_text(encoding="utf-8")
+    body = text.split("assert_disables_precede_enables() {", 1)[1].split("\n}", 1)[0]
+
+    # It has to index the array configure is handed, not re-read the file.
+    assert "${configure_args[$index]}" in body
+    assert "ffmpeg-configure-args.txt" not in body
+
+
+def test_the_order_check_runs_before_configure():
+    text = PREP.read_text(encoding="utf-8")
+
+    assert text.index("assert_disables_precede_enables\n") < text.index("./configure ")
+
+
+def test_the_order_check_is_bash_3_2_compatible():
+    text = PREP.read_text(encoding="utf-8")
+    body = text.split("assert_disables_precede_enables() {", 1)[1].split("\n}", 1)[0]
+
+    for feature in ("declare -A", "mapfile", "readarray", "[-1]", ",,}"):
+        assert feature not in body, f"{feature} is not in Bash 3.2"
+
+
+# ------------------------------------- the gate covers all three kinds now
+
+
+def test_the_gate_checks_encoders_muxers_and_filters():
+    assert req.CHECKED_COMPONENT_KINDS == ("ENCODER", "MUXER", "FILTER")
+
+
+def test_the_required_components_are_grouped_by_kind():
+    wanted = req.required_components_by_kind()
+
+    assert set(wanted["ENCODER"]) == set(req.REQUIRED_ENCODERS)
+    assert set(wanted["MUXER"]) == set(req.REQUIRED_MUXERS)
+    assert set(wanted["FILTER"]) == set(req.REQUIRED_FILTERS)
+    # Only the muxers have a second spelling.
+    assert wanted["MUXER"]["s16le"] == "pcm_s16le"
+    assert wanted["ENCODER"]["pcm_s16le"] == "pcm_s16le"
+    assert wanted["FILTER"]["aresample"] == "aresample"
+
+
+def write_components_header(
+    tree: Path,
+    muxers: dict[str, int] | None = None,
+    encoders: dict[str, int] | None = None,
+    filters: dict[str, int] | None = None,
+    filename: str = "config_components.h",
+) -> None:
+    """Write the header layout FFmpeg 5.1 and later actually generate."""
+    lines = ["/* Automatically generated by configure - do not modify! */"]
+    for kind, values in (
+        ("MUXER", muxers or {}),
+        ("ENCODER", encoders or {}),
+        ("FILTER", filters or {}),
+    ):
+        for name, value in values.items():
+            lines.append(f"#define CONFIG_{name.upper()}_{kind} {value}")
+    (tree / filename).write_text("\n".join(lines), encoding="utf-8")
+
+
+def complete_tree(tmp_path: Path) -> Path:
+    tree = tmp_path / "ffmpeg-complete"
+    tree.mkdir()
+    configure = tree / "configure"
+    configure.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--list-muxers" ]; then\n'
+        '  printf "%s\\n" "pcm_s16le pcm_f32le wav null"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    configure.chmod(0o755)
+    # config.h carries the global settings only, which is the layout that
+    # made the gate report every component disabled.
+    (tree / "config.h").write_text(
+        "#define CONFIG_STATIC 1\n#define CONFIG_SHARED 0\n", encoding="utf-8"
+    )
+    write_components_header(
+        tree,
+        muxers={"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
+        encoders={"pcm_s16le": 1, "pcm_f32le": 1},
+        filters={name: 1 for name in req.REQUIRED_FILTERS},
+    )
+    return tree
+
+
+def test_the_components_header_is_where_modern_ffmpeg_records_them():
+    """FFmpeg 5.1 moved them out of config.h; reading only that found none."""
+    assert "config_components.h" in req.GENERATED_CONFIG_HEADERS
+    assert req.GENERATED_CONFIG_HEADERS.index("config_components.h") < (
+        req.GENERATED_CONFIG_HEADERS.index("config.h")
+    )
+
+
+def test_a_complete_tree_in_the_modern_layout_passes(tmp_path):
+    """The exact false negative: config.h present, components elsewhere."""
+    tree = complete_tree(tmp_path)
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 0, result.stderr
+    assert "Safe to compile" in result.stdout
+    for line in ("muxer s16le enabled as pcm_s16le", "encoder pcm_s16le enabled",
+                 "filter aresample enabled"):
+        assert line in result.stdout
+
+
+def test_a_missing_encoder_fails_the_gate(tmp_path):
+    tree = complete_tree(tmp_path)
+    write_components_header(
+        tree,
+        muxers={"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
+        encoders={"pcm_s16le": 1, "pcm_f32le": 0},
+        filters={name: 1 for name in req.REQUIRED_FILTERS},
+    )
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 1
+    assert "CONFIG_PCM_F32LE_ENCODER" in result.stderr
+
+
+def test_a_missing_filter_fails_the_gate(tmp_path):
+    tree = complete_tree(tmp_path)
+    write_components_header(
+        tree,
+        muxers={"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
+        encoders={"pcm_s16le": 1, "pcm_f32le": 1},
+        filters={"aresample": 1, "anull": 1, "aformat": 1, "atrim": 1, "copy": 0},
+    )
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 1
+    assert "CONFIG_COPY_FILTER" in result.stderr
+
+
+def test_the_old_single_header_layout_still_works(tmp_path):
+    """An older tree puts everything in config.h; both are read and merged."""
+    tree = complete_tree(tmp_path)
+    (tree / "config_components.h").unlink()
+    write_components_header(
+        tree,
+        muxers={"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
+        encoders={"pcm_s16le": 1, "pcm_f32le": 1},
+        filters={name: 1 for name in req.REQUIRED_FILTERS},
+        filename="config.h",
+    )
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_header_under_ffbuild_is_also_read(tmp_path):
+    tree = complete_tree(tmp_path)
+    (tree / "config.h").unlink()
+    (tree / "config_components.h").unlink()
+    (tree / "ffbuild").mkdir()
+    write_components_header(
+        tree / "ffbuild",
+        muxers={"pcm_s16le": 1, "pcm_f32le": 1, "wav": 1, "null": 1},
+        encoders={"pcm_s16le": 1, "pcm_f32le": 1},
+        filters={name: 1 for name in req.REQUIRED_FILTERS},
+    )
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_no_header_anywhere_says_configure_has_not_run(tmp_path):
+    tree = complete_tree(tmp_path)
+    (tree / "config.h").unlink()
+    (tree / "config_components.h").unlink()
+
+    result = run_cli("--check-configured", str(tree))
+
+    assert result.returncode == 1
+    assert "configure has not run" in result.stderr
+
+
+def test_a_kind_can_be_read_on_its_own(tmp_path):
+    tree = complete_tree(tmp_path)
+
+    assert "pcm_s16le" in req.configured_components(tree, "ENCODER")
+    assert "aresample" in req.configured_components(tree, "FILTER")
+    assert "pcm_s16le" in req.configured_muxer_components(tree)
+
+
+def test_the_script_names_the_broader_log_file():
+    text = PREP.read_text(encoding="utf-8")
+
+    assert "ffmpeg-configured-components.txt" in text
+    assert "encoders, muxers and filters" in text

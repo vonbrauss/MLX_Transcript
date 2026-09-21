@@ -308,7 +308,11 @@ def test_reading_the_configure_flags_keeps_every_one(tmp_path):
     source = PREP.read_text(encoding="utf-8")
     bodies = [
         re.search(rf"{name}\(\) \{{.*?\n\}}", source, re.S)
-        for name in ("read_configure_args", "assert_configure_args_are_clean")
+        for name in (
+            "read_configure_args",
+            "assert_configure_args_are_clean",
+            "assert_disables_precede_enables",
+        )
     ]
     assert all(bodies), "the configure-argument functions could not be located"
     tree = fake_source_tree(tmp_path)

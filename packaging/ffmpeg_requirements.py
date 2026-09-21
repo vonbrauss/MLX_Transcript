@@ -65,7 +65,13 @@ __all__ = [
     "assert_flags_are_well_formed",
     "available_muxer_components",
     "configure_arguments",
+    "configured_components",
     "configured_muxer_components",
+    "required_components_by_kind",
+    "assert_disables_precede_enables",
+    "BROAD_DISABLE_FLAGS",
+    "CHECKED_COMPONENT_KINDS",
+    "GENERATED_CONFIG_HEADERS",
     "resolve_muxer_components",
     "listed_components",
     "make_probe_media",
@@ -277,31 +283,103 @@ def _component_for(label: str, name: str) -> str:
     return name
 
 
-def configured_muxer_components(source_tree: str | Path) -> set[str]:
-    """Read back which muxers a finished configure actually turned on.
+#: Where a finished configure records its per-component ``#define``s. FFmpeg
+#: 5.1 moved every ``CONFIG_<NAME>_<KIND>`` out of ``config.h`` and into
+#: ``config_components.h``, to stop a component change rebuilding the world.
+#: Reading only ``config.h`` on such a tree finds the file, finds none of the
+#: defines, and reports every component disabled -- including ``null``, which
+#: has no dependencies and cannot plausibly be off. All four candidates are
+#: read and merged so the check works on either layout.
+GENERATED_CONFIG_HEADERS: tuple[str, ...] = (
+    "config_components.h",
+    "ffbuild/config_components.h",
+    "config.h",
+    "ffbuild/config.h",
+)
 
-    configure writes ``#define CONFIG_PCM_S16LE_MUXER 1`` for each one it
-    enabled (and ``0`` for each it did not), so this is the state compilation
-    is about to use, not a restatement of what was asked for.
+#: The component kinds the gate checks, as the ``#define`` suffix.
+CHECKED_COMPONENT_KINDS: tuple[str, ...] = ("ENCODER", "MUXER", "FILTER")
+
+
+def configured_components(source_tree: str | Path, kind: str) -> set[str]:
+    """Read back which components of ``kind`` a finished configure turned on.
+
+    configure writes ``#define CONFIG_PCM_S16LE_MUXER 1`` for each component
+    it enabled and ``0`` for each it did not, so this is the state compilation
+    is about to use rather than a restatement of what was asked for.
     """
     tree = Path(source_tree)
-    for relative in ("ffbuild/config.h", "config.h"):
-        header = tree / relative
-        if header.is_file():
-            break
-    else:
+    headers = [tree / relative for relative in GENERATED_CONFIG_HEADERS]
+    present = [header for header in headers if header.is_file()]
+    if not present:
         raise MediaToolError(
-            f"No generated config.h under {tree}; configure has not run yet."
+            f"No generated config header under {tree} (looked for "
+            + ", ".join(GENERATED_CONFIG_HEADERS)
+            + "); configure has not run yet."
         )
 
-    enabled = set()
-    for match in re.finditer(
-        r"^#define CONFIG_([A-Z0-9_]+)_MUXER 1$",
-        header.read_text(encoding="utf-8", errors="replace"),
-        re.M,
-    ):
-        enabled.add(match.group(1).lower())
+    pattern = re.compile(rf"^#define CONFIG_([A-Z0-9_]+)_{kind.upper()} 1$", re.M)
+    enabled: set[str] = set()
+    for header in present:
+        text = header.read_text(encoding="utf-8", errors="replace")
+        enabled |= {match.group(1).lower() for match in pattern.finditer(text)}
     return enabled
+
+
+def configured_muxer_components(source_tree: str | Path) -> set[str]:
+    """The muxers a finished configure turned on. See :func:`configured_components`."""
+    return configured_components(source_tree, "MUXER")
+
+
+def required_components_by_kind(
+    available_muxers: set[str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Per kind, the component name to enable keyed by the name it is known as.
+
+    For encoders and filters the two are the same. For muxers they are not:
+    the format is ``s16le`` and the component is ``pcm_s16le``, so the key is
+    what a built FFmpeg reports and the value is what configure takes.
+    """
+    return {
+        "ENCODER": {name: name for name in REQUIRED_ENCODERS},
+        "MUXER": resolve_muxer_components(available_muxers),
+        "FILTER": {name: name for name in REQUIRED_FILTERS},
+    }
+
+
+#: ``--disable-<kind>s`` and the selective flag it must precede.
+BROAD_DISABLE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--disable-encoders", "--enable-encoder="),
+    ("--disable-muxers", "--enable-muxer="),
+    ("--disable-filters", "--enable-filter="),
+)
+
+
+def assert_disables_precede_enables(flags: list[str]) -> None:
+    """Raise unless each broad disable comes before its selective enables.
+
+    FFmpeg's configure applies options in the order it reads them, so a
+    ``--disable-muxers`` after ``--enable-muxer=pcm_s16le`` undoes it without
+    a word of complaint. The recipe has always been ordered correctly, and
+    this is what keeps an edit from quietly reversing it.
+    """
+    problems = []
+    for broad, selective in BROAD_DISABLE_FLAGS:
+        if broad not in flags:
+            continue
+        broad_at = flags.index(broad)
+        for position, flag in enumerate(flags):
+            if flag.startswith(selective) and position < broad_at:
+                problems.append(
+                    f"{broad} is at position {broad_at}, after {flag} at "
+                    f"position {position}; it would undo it"
+                )
+
+    if problems:
+        raise MediaToolError(
+            "The configure flags are in an order that cancels itself:\n  "
+            + "\n  ".join(problems)
+        )
 
 
 def configure_arguments(
@@ -346,6 +424,7 @@ def configure_arguments(
         "--enable-audiotoolbox",
     ]
     assert_flags_are_well_formed(arguments)
+    assert_disables_precede_enables(arguments)
     return arguments
 
 
@@ -639,21 +718,38 @@ def main(argv: list[str] | None = None) -> int:
         tree = arguments.check_configured
         try:
             available = available_muxer_components(tree)
-            wanted = resolve_muxer_components(available)
-            enabled = configured_muxer_components(tree)
+            wanted = required_components_by_kind(available)
         except MediaToolError as error:
             print(f"\n{error}\n", file=sys.stderr)
             return 1
 
-        missing = [
-            f"--enable-muxer={component} did not enable the {muxer} muxer "
-            f"(CONFIG_{component.upper()}_MUXER is not 1)"
-            for muxer, component in sorted(wanted.items())
-            if component not in enabled
-        ]
+        missing = []
+        confirmed = []
+        for kind in CHECKED_COMPONENT_KINDS:
+            try:
+                enabled = configured_components(tree, kind)
+            except MediaToolError as error:
+                print(f"\n{error}\n", file=sys.stderr)
+                return 1
+            label = kind.lower()
+            for name, component in sorted(wanted[kind].items()):
+                if component in enabled:
+                    if name == component:
+                        confirmed.append(f"  {label} {name} enabled")
+                    else:
+                        confirmed.append(
+                            f"  {label} {name} enabled as {component}"
+                        )
+                else:
+                    missing.append(
+                        f"--enable-{label}={component} did not enable the "
+                        f"{name} {label} (CONFIG_{component.upper()}_{kind} "
+                        "is not 1)"
+                    )
+
         if missing:
             print(
-                "\nconfigure finished but the required muxers are not enabled.\n"
+                "\nconfigure finished but required components are not enabled.\n"
                 "Compiling now would produce the FFmpeg that fails with\n"
                 '  "Requested output format \'s16le\' is not known."\n\n  '
                 + "\n  ".join(missing)
@@ -661,9 +757,11 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        for muxer, component in sorted(wanted.items()):
-            print(f"  {muxer} muxer enabled as {component}")
-        print("\nEvery required muxer is enabled. Safe to compile.")
+        print("\n".join(confirmed))
+        print(
+            f"\nAll {len(confirmed)} required encoders, muxers and filters are "
+            "enabled. Safe to compile."
+        )
         return 0
 
     ffmpeg, ffprobe = arguments.verify
