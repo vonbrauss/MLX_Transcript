@@ -38,11 +38,13 @@ __all__ = [
     "OutputOptions",
     "OutputRoots",
     "TranscriptPaths",
+    "SOURCE_PACKAGE_CONFLICT_MESSAGE",
     "atomic_write_text",
     "build_output_paths",
     "clean_scriptsync_text",
     "existing_outputs",
     "make_timecoded_text",
+    "output_parent_conflicts_with_source",
     "output_roots",
     "transcript_prefix",
     "write_scriptsync",
@@ -171,6 +173,67 @@ def output_roots(output_parent: Path) -> OutputRoots:
         timecoded=transcription / TIMECODED_FOLDER,
         subtitles=transcription / SUBTITLES_FOLDER,
     )
+
+
+#: Shown when a chosen destination would put the output tree inside the
+#: application's own Python package. Deliberately free of jargon: the reader
+#: does not need to know what a package is to act on it.
+SOURCE_PACKAGE_CONFLICT_MESSAGE = (
+    "Choose another save location. This folder contains MLX Transcript's "
+    "application files."
+)
+
+
+def output_parent_conflicts_with_source(output_parent: Path | None) -> Path | None:
+    """Return the colliding folder when the output tree would land in our source.
+
+    The output tree is created at ``<output parent>/Transcription``. macOS
+    filesystems are case-insensitive by default, so on a checkout of this
+    project that path resolves onto the ``transcription/`` Python package
+    rather than to a new folder. Creating the tree then writes ScriptSync and
+    Timecoded folders straight into the application's own source, which is
+    both surprising and destructive to a working copy.
+
+    Two independent signals are checked, because either one alone can miss:
+
+    * The resolved folder holds an ``__init__.py``. Only a Python package
+      does; a real output tree holds transcripts and nothing else. This
+      catches any checkout, not only the one being run.
+    * The resolved folder is this very package. This catches a checkout whose
+      ``__init__.py`` is missing or unreadable.
+
+    Returns the offending folder so a caller can name it, or ``None`` when the
+    destination is fine. A destination that merely has an existing output tree
+    is fine and is left alone.
+    """
+    if output_parent is None:
+        return None
+
+    candidate = Path(output_parent) / TRANSCRIPTION_FOLDER
+    try:
+        if not candidate.is_dir():
+            return None
+        resolved = candidate.resolve()
+    except OSError:
+        # An unreadable destination is a different problem, reported when the
+        # batch tries to create the tree.
+        return None
+
+    try:
+        if (resolved / "__init__.py").is_file():
+            return resolved
+    except OSError:
+        pass
+
+    # samefile compares device and inode, so it answers "is this the same
+    # folder" correctly even when the two paths differ only in case, which is
+    # exactly the situation this guard exists for.
+    try:
+        if resolved.samefile(Path(__file__).resolve().parent):
+            return resolved
+    except OSError:
+        pass
+    return None
 
 
 def transcript_prefix(source: Path) -> str:

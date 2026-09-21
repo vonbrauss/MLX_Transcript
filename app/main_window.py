@@ -96,7 +96,13 @@ from transcription.engine import (
 )
 from transcription.media_probe import ffprobe_available, format_duration
 from transcription.model_cache import DEFAULT_BUNDLE, ModelCache, ModelState
-from transcription.outputs import FolderLayout, NameStyle, output_roots
+from transcription.outputs import (
+    SOURCE_PACKAGE_CONFLICT_MESSAGE,
+    FolderLayout,
+    NameStyle,
+    output_parent_conflicts_with_source,
+    output_roots,
+)
 from transcription.pipeline import BatchJob
 from transcription.presets import CleanupPreset, preset_values
 from transcription.speaker_presets import SpeakerPreset, preset_values as speaker_preset_values
@@ -1386,7 +1392,9 @@ class MainWindow(QMainWindow):
         if not chosen:
             return
         self.source_field.setText(chosen)
-        if not self.output_field.text().strip():
+        if not self.output_field.text().strip() and (
+            output_parent_conflicts_with_source(Path(chosen).expanduser()) is None
+        ):
             self.output_field.setText(chosen)
         self._refresh_output_preview()
         self._queue_sources([Path(chosen)])
@@ -1404,10 +1412,29 @@ class MainWindow(QMainWindow):
             return
         paths = [Path(path) for path in chosen]
         self.source_field.setText(str(paths[-1]))
-        if not self.output_field.text().strip():
+        if not self.output_field.text().strip() and (
+            output_parent_conflicts_with_source(paths[0].parent) is None
+        ):
             self.output_field.setText(str(paths[0].parent))
         self._refresh_output_preview()
         self._queue_sources(paths)
+
+    def _output_parent_is_usable(self, parent: Path | None) -> bool:
+        """Refuse a destination whose output tree would land in our own source.
+
+        On a case-insensitive filesystem ``<parent>/Transcription`` resolves
+        onto this project's ``transcription/`` package, so creating the tree
+        would write transcripts into the application's source folder.
+        """
+        conflict = output_parent_conflicts_with_source(parent)
+        if conflict is None:
+            return True
+        QMessageBox.warning(
+            self,
+            "That folder cannot be used",
+            f"{SOURCE_PACKAGE_CONFLICT_MESSAGE}\n\n{conflict}",
+        )
+        return False
 
     def _choose_output_parent(self) -> None:
         start = (
@@ -1417,6 +1444,8 @@ class MainWindow(QMainWindow):
         )
         chosen = QFileDialog.getExistingDirectory(self, "Choose output parent", start)
         if not chosen:
+            return
+        if not self._output_parent_is_usable(Path(chosen).expanduser()):
             return
         self.output_field.setText(chosen)
         self._refresh_output_preview()
@@ -1431,6 +1460,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_output_text_changed(self) -> None:
+        # A typed destination is refused the same way a browsed one is, and the
+        # field is cleared so an unusable path is never left armed for Start.
+        if not self._output_parent_is_usable(self.output_parent):
+            self.output_field.clear()
         self._refresh_output_preview()
 
     def _refresh_output_preview(self) -> None:
@@ -1991,6 +2024,9 @@ class MainWindow(QMainWindow):
                 "Choose folders first",
                 "Choose a media source and a destination folder.",
             )
+            return
+        if not self._output_parent_is_usable(output_parent):
+            self._select_section("folders")
             return
 
         rows = [
