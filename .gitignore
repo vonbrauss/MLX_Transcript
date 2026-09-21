@@ -22,8 +22,17 @@ env/
 .DS_Store
 ._*
 
-# Local output and media
-Transcription/
+# Local output and media.
+#
+# NOTE: the bare pattern "Transcription/" used to live here. On a
+# case-insensitive filesystem git sets core.ignorecase=true, so it also
+# matched the transcription/ source package and silently kept the whole
+# package out of the repository. The patterns below name a second path
+# component, which the source package does not have, so they cannot
+# collide with it again.
+/Transcription/ScriptSync/
+/Transcription/Timecoded/
+/Transcription/Subtitles/
 *.mov
 *.mp4
 *.wav
