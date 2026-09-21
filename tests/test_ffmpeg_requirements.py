@@ -340,7 +340,9 @@ def test_the_build_script_generates_the_flags_rather_than_repeating_them():
 
     assert "ffmpeg_requirements.py" in text
     assert "--configure-args" in text
-    assert './configure "${configure_args[@]}"' in text
+    # The guarded expansion, because Bash 3.2 treats "${a[@]}" on an empty
+    # array as an unbound variable under set -u.
+    assert './configure ${configure_args[@]+"${configure_args[@]}"}' in text
 
 
 def test_the_build_script_no_longer_carries_a_comma_separated_flag():

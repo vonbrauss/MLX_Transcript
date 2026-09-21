@@ -1,7 +1,19 @@
-#!/bin/zsh
+#!/bin/bash
+# Targets the Bash that ships with macOS (3.2). No zsh expansions, and none
+# of the features Bash 4 added. See the PORTABILITY note in
+# scripts/finish_release_prep.sh and tests/test_shell_compatibility.py.
+# Checked before "set -o pipefail", which a non-Bash shell rejects outright.
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf '%s\n' "This script needs Bash. Run: bash scripts/build_macos.sh" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
-project_root="${0:A:h:h}"
+# Resolved without zsh's :A:h modifiers, which Bash reads as a substring
+# expansion and rejects under set -u.
+script_dir=$(cd "$(dirname "$0")" && pwd)
+project_root=$(cd "$script_dir/.." && pwd)
 cd "$project_root"
 stage="$(mktemp -d /private/tmp/mlx-transcript-build.XXXXXX)"
 export PYINSTALLER_CONFIG_DIR="$stage/pyinstaller-config"
