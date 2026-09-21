@@ -236,6 +236,8 @@ class MainWindow(QMainWindow):
         # model-loading state to the real count.
         self._batch_total = 0
         self._batch_done = 0
+        #: ``(path, reason)`` for files the last scan turned away.
+        self._skipped_files: list[tuple[Path, str]] = []
 
         self.setWindowTitle("MLX Transcript")
         self.setMinimumSize(940, 560)
@@ -981,7 +983,9 @@ class MainWindow(QMainWindow):
         help_text.setHtml(
             "<h2>Getting started</h2>"
             "<ol>"
-            "<li>Open <b>Folders</b> and add media with the buttons, or drag files and folders into the drop area.</li>"
+            "<li>Open <b>Folders</b> and add media with the buttons, or drag files and folders into the drop area. "
+            "MLX Transcript accepts any local media file FFmpeg can read that contains audio, whatever its "
+            "filename, and reports anything it had to skip.</li>"
             "<li>Choose a destination under <b>Save transcripts to</b>. The app creates a Transcription folder there.</li>"
             "<li>Review, remove, or clear files in <b>Queue</b>. Multiple folders stay separate in the output tree.</li>"
             "<li>Choose your Whisper model and cleanup preset in <b>Transcription</b>.</li>"
@@ -1556,6 +1560,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.found_files.connect(self._on_found_files)
+        worker.skipped_files.connect(self._on_scan_skipped)
         worker.item_ready.connect(self._on_item_ready)
         worker.progress.connect(self._on_scan_progress)
         worker.failed.connect(self._on_scan_failed)
@@ -1646,6 +1651,28 @@ class MainWindow(QMainWindow):
             if wait:
                 thread.wait(5000)
 
+    @Slot(list)
+    def _on_scan_skipped(self, skipped: list) -> None:
+        """Remember what the scan turned away so the summary can report it."""
+        self._skipped_files = [(Path(path), str(reason)) for path, reason in skipped]
+
+    def _skipped_summary(self) -> str:
+        """One short clause naming how many files were skipped."""
+        count = len(self._skipped_files)
+        if not count:
+            return ""
+        return f" {count} file{'s' if count != 1 else ''} skipped."
+
+    def _skipped_detail(self) -> str:
+        """The per-file reasons, for the tooltip on the queue summary."""
+        if not self._skipped_files:
+            return ""
+        shown = self._skipped_files[:15]
+        lines = [f"{path.name} — {reason}" for path, reason in shown]
+        if len(self._skipped_files) > len(shown):
+            lines.append(f"… and {len(self._skipped_files) - len(shown)} more")
+        return "Skipped:\n" + "\n".join(lines)
+
     @Slot(int)
     def _on_found_files(self, total: int) -> None:
         self.progress_bar.setRange(0, max(total, 1))
@@ -1700,17 +1727,22 @@ class MainWindow(QMainWindow):
         summary = f"{total} media file(s), {format_duration(seconds)} of runtime."
         if failures:
             summary += f" {failures} could not be read."
+        summary += self._skipped_summary()
         self.queue_summary.setText(summary)
+        self.queue_summary.setToolTip(self._skipped_detail())
         if not items and self._scan_sources:
             # The folder was readable, it simply held nothing this application
             # can transcribe. Saying which folder is what makes that useful.
             names = ", ".join(path.name for path in self._scan_sources[:3])
             if len(self._scan_sources) > 3:
                 names += ", …"
-            self.statusBar().showMessage(f"No supported media found in {names}.")
+            message = f"No audio was found in {names}."
+            if self._skipped_files:
+                message += self._skipped_summary()
+            self.statusBar().showMessage(message)
         else:
             self.statusBar().showMessage(
-                summary if total else "No supported media found."
+                summary if total else "No media with audio was found."
             )
         self._scan_thread = None
         self._scan_worker = None

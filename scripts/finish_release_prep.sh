@@ -51,11 +51,28 @@ stage_digests() {
 stage_ffmpeg() {
   if [[ -x "$ffmpeg_prefix/bin/ffmpeg" && -x "$ffmpeg_prefix/bin/ffprobe" ]]; then
     log "An LGPL FFmpeg is already installed at $ffmpeg_prefix"
-    "$ffmpeg_prefix/bin/ffmpeg" -version | head -3
+    log "Validating it rather than trusting it"
+    stage_validate_ffmpeg
     return 0
   fi
 
   command -v nasm >/dev/null || fail "nasm is required: brew install nasm pkg-config"
+
+  # Every component is enabled as its own configure flag, generated from
+  # packaging/ffmpeg_requirements.py so the recipe, the packaging gate and the
+  # tests cannot drift apart.
+  #
+  # This is what the first standalone build got wrong. FFmpeg's configure
+  # turns a comma-separated value into a shell case pattern and matches it
+  # against component entries named "s16le_muxer" and "f32le_muxer", so
+  # --enable-muxer=f32le,s16le,wav,null matched nothing, the warning scrolled
+  # past in the build log, --disable-muxers won, and the app failed on its
+  # first real clip with "Requested output format 's16le' is not known."
+  local -a configure_args
+  configure_args=("${(@f)$(python3 "$project_root/packaging/ffmpeg_requirements.py" \
+    --configure-args --prefix "$ffmpeg_prefix")}")
+  print -r -- "${(F)configure_args}" > build/ffmpeg-configure-args.txt
+  log "${#configure_args} configure flags recorded in build/ffmpeg-configure-args.txt"
 
   local work
   work="$(mktemp -d /private/tmp/mlx-ffmpeg-build.XXXXXX)"
@@ -68,35 +85,28 @@ stage_ffmpeg() {
     tar xf "ffmpeg-${ffmpeg_version}.tar.xz"
     cd "ffmpeg-${ffmpeg_version}"
 
-    # Decode and probe only. Every decoder, demuxer, parser, and protocol
-    # stays enabled, which is what keeps MXF, AVI, MTS, M2TS, WMV, MOV, MP4,
-    # MKV and the audio containers readable. Only encoding and muxing are
-    # trimmed, and only down to the raw PCM and WAV the diarizer's pipe needs.
-    ./configure \
-      --prefix="$ffmpeg_prefix" \
-      --disable-gpl --disable-nonfree --disable-version3 \
-      --disable-doc --disable-debug --disable-network \
-      --disable-encoders --enable-encoder=pcm_f32le,pcm_s16le \
-      --disable-muxers  --enable-muxer=f32le,s16le,wav,null \
-      --disable-filters --enable-filter=aresample,anull,aformat,atrim,copy \
-      --disable-devices --disable-ffplay \
-      --enable-static --disable-shared \
-      --enable-videotoolbox --enable-audiotoolbox
+    ./configure "${configure_args[@]}"
 
     make -j"$(sysctl -n hw.ncpu)"
     make install
   } 2>&1 | tee build/ffmpeg-build.log
 
   [[ -x "$ffmpeg_prefix/bin/ffmpeg" ]] || fail "The FFmpeg build did not install."
-
-  log "Confirming the build carries no GPL components"
-  local configuration
-  configuration="$("$ffmpeg_prefix/bin/ffmpeg" -version | grep '^ *configuration:' || true)"
-  print -r -- "$configuration" | tee build/ffmpeg-lgpl-configuration.txt
-  if print -r -- "$configuration" | grep -qE -- '--enable-(gpl|nonfree)'; then
-    fail "The build still reports GPL components."
-  fi
+  stage_validate_ffmpeg
   log "Installed at $ffmpeg_prefix"
+}
+
+stage_validate_ffmpeg() {
+  # Licence, every required component, and two real decodes to raw PCM. A
+  # build that passes this cannot fail the way the first one did.
+  log "Validating: licence, components, and two real decodes to raw PCM"
+  if ! python3 "$project_root/packaging/ffmpeg_requirements.py" --verify \
+       "$ffmpeg_prefix/bin/ffmpeg" "$ffmpeg_prefix/bin/ffprobe" \
+       2>&1 | tee build/ffmpeg-validation.txt; then
+    fail "This FFmpeg cannot do what MLX Transcript needs. See build/ffmpeg-validation.txt"
+  fi
+  "$ffmpeg_prefix/bin/ffmpeg" -version | grep '^ *configuration:' \
+    > build/ffmpeg-lgpl-configuration.txt || true
 }
 
 stage_build() {
@@ -106,6 +116,11 @@ stage_build() {
 
   export MLX_TRANSCRIPT_FFMPEG="$ffmpeg_prefix/bin/ffmpeg"
   export MLX_TRANSCRIPT_FFPROBE="$ffmpeg_prefix/bin/ffprobe"
+
+  log "Re-validating the media tools before packaging"
+  python3 "$project_root/packaging/ffmpeg_requirements.py" --verify \
+    "$MLX_TRANSCRIPT_FFMPEG" "$MLX_TRANSCRIPT_FFPROBE" \
+    || fail "The media tools no longer pass validation."
 
   log "Building the application with the LGPL media tools"
   scripts/build_macos.sh 2>&1 | tee build/app-build.log
@@ -137,8 +152,8 @@ case "$stage" in
   ffmpeg)  stage_ffmpeg ;;
   build)   stage_build ;;
   all)
-    stage_tests
-    stage_digests
+    # digests is deliberately not here: it needs a large download and is
+    # opt-in. Run it on its own when you want the assets pinned.
     stage_tests
     stage_ffmpeg
     stage_build

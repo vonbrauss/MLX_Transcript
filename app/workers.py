@@ -22,7 +22,7 @@ from app.models import (
     source_identity,
 )
 from transcription.diarization import DiarizationBackend, DiarizationOptions
-from transcription.discovery import discover_media
+from transcription.discovery import discover_media, is_supported_media
 from transcription.engine import TranscriptionEngine
 from transcription.media_probe import MediaProbeError, probe_media
 from transcription.model_cache import (
@@ -59,6 +59,7 @@ class ScanWorker(QObject):
     """Find media below a source folder and read each duration with ffprobe."""
 
     started_scan = Signal()
+    skipped_files = Signal(list)
     found_files = Signal(int)
     item_ready = Signal(int, object)
     progress = Signal(int, int)
@@ -78,6 +79,10 @@ class ScanWorker(QObject):
             else [Path(source_root)]
         )
         self.output_parent = Path(output_parent) if output_parent else None
+        #: ``(path, reason)`` for everything this scan turned away, so the
+        #: window can show a concise summary instead of dropping files
+        #: silently.
+        self.skipped: list[tuple[Path, str]] = []
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -98,11 +103,20 @@ class ScanWorker(QObject):
             logger.exception("The media scan failed")
             self.failed.emit(f"The media scan could not finish: {error}")
         finally:
+            # Emitted before finished, so the window has the skipped list when
+            # it builds the queue summary.
+            self.skipped_files.emit(list(self.skipped))
             self.finished.emit(items)
 
     def _scan(self) -> list[QueueItem]:
-        """Do the scanning work and return everything that was queued."""
+        """Do the scanning work and return everything that was queued.
+
+        Whether a file can be transcribed is decided by ffprobe finding an
+        audio stream, not by its filename. The extension list is only a fast
+        path that keeps obvious non-media out of the probe queue.
+        """
         self.started_scan.emit()
+        self.skipped = []
         items: list[QueueItem] = []
 
         excluded: list[Path] = []
@@ -119,7 +133,9 @@ class ScanWorker(QObject):
                 if not root.exists():
                     self.failed.emit(f"Source does not exist: {root}")
                     continue
-                for found in discover_media(root, excluded_roots=excluded):
+                for found in discover_media(
+                    root, excluded_roots=excluded, rejected=self.skipped
+                ):
                     identity = source_identity(found.path)
                     if identity not in seen:
                         seen.add(identity)
@@ -154,18 +170,61 @@ class ScanWorker(QObject):
                     found.path, found.source_root, self.output_parent
                 )
 
+            expected_media = is_supported_media(found.path)
             try:
-                item.media = probe_media(found.path)
-                item.status = QueueStatus.READY
+                media = probe_media(found.path)
             except MediaProbeError as error:
-                item.status = QueueStatus.FAILED
-                item.message = str(error)
+                if expected_media:
+                    # A file whose extension says it is media stays visible in
+                    # the queue as a failure, because the user meant to queue
+                    # it and needs to see that it could not be read.
+                    item.status = QueueStatus.FAILED
+                    item.message = str(error)
+                else:
+                    self.skipped.append(
+                        (found.path, self._probe_failure_reason(error))
+                    )
+                    self.progress.emit(index + 1, total)
+                    continue
+            else:
+                if not self._has_usable_audio(media, expected_media):
+                    self.skipped.append((found.path, "no audio stream"))
+                    self.progress.emit(index + 1, total)
+                    continue
+                item.media = media
+                item.status = QueueStatus.READY
 
             items.append(item)
             self.item_ready.emit(index, item)
             self.progress.emit(index + 1, total)
 
         return items
+
+    @staticmethod
+    def _has_usable_audio(media, expected_media: bool) -> bool:
+        """Decide whether a probed file carries audio worth transcribing.
+
+        ``stream_count`` of zero means ffprobe told us nothing about the
+        streams rather than that there is no audio, so a file whose extension
+        says it is media is given the benefit of the doubt instead of being
+        dropped on a reading we cannot trust.
+        """
+        if media.has_audio:
+            return True
+        if media.stream_count == 0:
+            return expected_media
+        return False
+
+    @staticmethod
+    def _probe_failure_reason(error: Exception) -> str:
+        """Turn a probe failure into a short reason for the skipped summary."""
+        detail = str(error).strip()
+        if ": " in detail:
+            detail = detail.split(": ", 1)[1]
+        detail = " ".join(detail.split())
+        if len(detail) > 120:
+            detail = detail[:119] + "\u2026"
+        return f"could not be read ({detail})" if detail else "could not be read"
 
 
 class ModelDownloadWorker(QObject):

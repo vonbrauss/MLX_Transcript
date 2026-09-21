@@ -34,10 +34,43 @@ It was built with --enable-gpl, which makes the binary GPL and puts a
 source-distribution obligation on every release.
 ```
 
+### Why two raw PCM formats
+
+MLX Transcript never encodes media, but it does need FFmpeg to hand it raw
+audio samples on a pipe, and it needs them in two different shapes:
+
+| Format | Encoder | Muxer | Who asks for it |
+| --- | --- | --- | --- |
+| 16-bit signed integer | `pcm_s16le` | `s16le` | `mlx_whisper.load_audio`, on every clip |
+| 32-bit float | `pcm_f32le` | `f32le` | `transcription/diarization.py`, for speaker detection |
+
+Both are *headerless*: the muxer writes nothing but samples, which is exactly
+what the two callers read. `wav` and `null` are enabled as well, because the
+build's own validation and any hand debugging want a container with a header
+and a sink that discards output.
+
+An FFmpeg missing either pair looks completely healthy. It reports its
+version, it probes files, durations and timecode appear in the queue, and then
+the first real clip fails with:
+
+```text
+Requested output format 's16le' is not known.
+```
+
+That is what shipped in the first standalone build, so the components are now
+declared in one place, `packaging/ffmpeg_requirements.py`, and the build
+refuses to package an FFmpeg that cannot produce both.
+
 ### Building an LGPL FFmpeg to bundle
 
-Build once, then point the recipe at it. A decode-and-probe build is small and
-has no external dependencies:
+The easy way is to let the script do it:
+
+```bash
+scripts/finish_release_prep.sh ffmpeg
+```
+
+That generates the configure flags from `packaging/ffmpeg_requirements.py`,
+builds, and then validates the result. To do it by hand:
 
 ```bash
 brew install nasm pkg-config
@@ -48,25 +81,83 @@ cd ffmpeg-7.1.1
 
 ./configure \
   --prefix="$HOME/ffmpeg-lgpl" \
-  --disable-gpl --disable-nonfree --disable-version3 \
-  --disable-doc --disable-debug --disable-network \
-  --disable-encoders --enable-encoder=pcm_f32le,pcm_s16le \
-  --disable-muxers  --enable-muxer=f32le,s16le,wav,null \
-  --disable-filters --enable-filter=aresample,anull,aformat,atrim,copy \
-  --disable-devices --disable-ffplay \
-  --enable-static --disable-shared \
-  --enable-videotoolbox --enable-audiotoolbox
+  --disable-gpl \
+  --disable-nonfree \
+  --disable-version3 \
+  --disable-doc \
+  --disable-debug \
+  --disable-network \
+  --disable-devices \
+  --disable-ffplay \
+  --disable-encoders \
+  --disable-muxers \
+  --disable-filters \
+  --enable-encoder=pcm_s16le \
+  --enable-encoder=pcm_f32le \
+  --enable-muxer=s16le \
+  --enable-muxer=f32le \
+  --enable-muxer=wav \
+  --enable-muxer=null \
+  --enable-filter=aresample \
+  --enable-filter=anull \
+  --enable-filter=aformat \
+  --enable-filter=atrim \
+  --enable-filter=copy \
+  --enable-static \
+  --disable-shared \
+  --enable-videotoolbox \
+  --enable-audiotoolbox
 
 make -j"$(sysctl -n hw.ncpu)"
 make install
 ```
 
-Decoders, demuxers, parsers, and protocols are all left enabled, which is what
-keeps MXF, AVI, MTS, M2TS, WMV, MOV, MP4, MKV, and every audio container
-readable. Only encoding and muxing are trimmed, and only down to the raw PCM
-and WAV output the diarizer's pipe needs.
+**Every component is its own flag, and that matters.** FFmpeg's `configure`
+turns a comma-separated value into a shell `case` pattern and matches it
+against its component list, whose entries are named `s16le_muxer` and
+`f32le_muxer`. So this:
 
-Then build with:
+```bash
+--enable-muxer=f32le,s16le,wav,null     # WRONG: matches nothing
+```
+
+matches nothing at all, prints a single `did not match anything` warning that
+scrolls past in a long build log, and leaves `--disable-muxers` in force. Use
+one flag per component instead:
+
+```bash
+--enable-muxer=f32le --enable-muxer=s16le --enable-muxer=wav --enable-muxer=null
+```
+
+Decoders, demuxers, parsers and protocols are all left enabled, which is what
+keeps MXF, AVI, MTS, M2TS, WMV, MOV, MP4, MKV and every audio container
+readable. Only encoding, muxing and filtering are trimmed, and only down to
+what the two PCM pipes above need.
+
+### Validating the result
+
+```bash
+python3 packaging/ffmpeg_requirements.py --verify \
+  "$HOME/ffmpeg-lgpl/bin/ffmpeg" "$HOME/ffmpeg-lgpl/bin/ffprobe"
+```
+
+This checks three things and exits non-zero on any of them:
+
+1. The reported configuration carries no `--enable-gpl`, `--enable-nonfree`,
+   x264, x265, libvmaf or libpostproc, and does report `--disable-gpl` and
+   `--disable-nonfree`.
+2. Every required encoder, muxer, filter, demuxer and decoder is listed by
+   `-encoders`, `-muxers`, `-filters`, `-demuxers` and `-decoders`. A missing
+   one is named along with the flag that would add it.
+3. A real media file decodes to **both** `s16le` and `f32le` PCM on stdout,
+   using the same command shape the application uses at runtime. The file is
+   a small WAV generated with the standard library, so no sample media has to
+   be checked in.
+
+The same validation runs again inside `packaging/MLX_Transcript.spec` before
+PyInstaller analyses anything, so a build cannot be packaged around it.
+
+### Then build with it
 
 ```bash
 export MLX_TRANSCRIPT_FFMPEG="$HOME/ffmpeg-lgpl/bin/ffmpeg"
@@ -75,8 +166,8 @@ scripts/build_macos.sh
 ```
 
 Verify afterwards that representative media still reads. At minimum: one MXF,
-one MOV with embedded timecode, one AVCHD `.mts`, one `.wav`, and one `.mp3`.
-Check that durations, frame rates, and timecode appear in the queue and that a
+one MOV with embedded timecode, one AVCHD `.mts`, one `.wav` and one `.mp3`.
+Check that durations, frame rates and timecode appear in the queue and that a
 transcript is produced.
 
 ### The environment variables

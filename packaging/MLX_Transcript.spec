@@ -2,6 +2,7 @@
 """PyInstaller recipe for the Apple Silicon macOS application."""
 
 from pathlib import Path
+import importlib.util
 import os
 import re
 import shutil
@@ -23,6 +24,22 @@ def read_version_constant(name):
 
 VERSION = read_version_constant("VERSION")
 BUILD_NUMBER = read_version_constant("BUILD_NUMBER")
+
+
+def load_ffmpeg_requirements():
+    """Load the shared FFmpeg contract by path.
+
+    The recipe must not depend on the project being importable, so the module
+    is loaded from its file rather than through sys.path.
+    """
+    location = project / "packaging" / "ffmpeg_requirements.py"
+    spec = importlib.util.spec_from_file_location("mlx_ffmpeg_requirements", location)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ffmpeg_requirements = load_ffmpeg_requirements()
 
 datas = []
 datas.append((str(project / "app" / "assets"), "app/assets"))
@@ -147,13 +164,15 @@ def gpl_flags_in(configuration):
     return [flag for flag in GPL_CONFIGURE_FLAGS if flag in configuration]
 
 
-def record_media_tool_provenance(entries):
+def record_media_tool_provenance(entries, validation):
     """Write what was bundled so the notices can describe the real binary."""
     report = project / "build" / "ffmpeg-configuration.txt"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
         "\n\n".join(f"{name}: {path}\nconfiguration: {configuration}"
                     for name, path, configuration in entries)
+        + "\n\nValidation\n"
+        + "\n".join(f"  {line}" for line in validation)
         + "\n",
         encoding="utf-8",
     )
@@ -162,6 +181,7 @@ def record_media_tool_provenance(entries):
 if os.environ.get("MLX_TRANSCRIPT_BUNDLE_FFMPEG", "1") == "1":
     allow_gpl = os.environ.get("MLX_TRANSCRIPT_ALLOW_GPL_FFMPEG") == "1"
     provenance = []
+    media_tools = {}
     for executable in ("ffmpeg", "ffprobe"):
         located = os.environ.get(f"MLX_TRANSCRIPT_{executable.upper()}") or shutil.which(
             executable
@@ -189,7 +209,26 @@ if os.environ.get("MLX_TRANSCRIPT_BUNDLE_FFMPEG", "1") == "1":
             )
         binaries.append((located, "bin"))
         provenance.append((executable, located, configuration))
-    record_media_tool_provenance(provenance)
+        media_tools[executable] = located
+
+    # The first standalone build shipped an FFmpeg with no s16le muxer and
+    # failed on the user's first clip. Nothing is packaged now until the
+    # located binaries have actually decoded a file to both raw PCM formats
+    # the application asks for at runtime.
+    try:
+        validation = ffmpeg_requirements.verify_media_tools(
+            media_tools["ffmpeg"], media_tools["ffprobe"], allow_gpl=allow_gpl
+        )
+    except ffmpeg_requirements.MediaToolError as error:
+        raise SystemExit(
+            "\nRefusing to package: the located FFmpeg cannot do what MLX "
+            f"Transcript needs.\n\n{error}\n\n"
+            "Rebuild it with the recipe in docs/BUILDING.md, or run:\n"
+            "  scripts/finish_release_prep.sh ffmpeg\n"
+        )
+    for line in validation:
+        print(f"  ffmpeg check: {line}")
+    record_media_tool_provenance(provenance, validation)
 
 a = Analysis(
     [str(project / "main.py")],

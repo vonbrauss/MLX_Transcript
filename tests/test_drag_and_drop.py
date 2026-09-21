@@ -319,9 +319,13 @@ def test_a_folder_with_no_media_says_which_folder(window, application, tmp_path)
     drain(window, application)
 
     assert window.items == []
-    assert "No supported media found in Paperwork" in (
-        window.statusBar().currentMessage()
-    )
+    message = window.statusBar().currentMessage()
+    # The wording changed when the audio-stream rule replaced the extension
+    # whitelist: the folder was readable, it simply held nothing with audio.
+    assert "No audio was found in Paperwork" in message
+    # And the PDF is accounted for rather than dropped silently.
+    assert "1 file skipped" in message
+    assert "call-sheet.pdf" in window.queue_summary.toolTip()
 
 
 # -------------------------------------------------------- the event filter

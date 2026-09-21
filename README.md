@@ -21,6 +21,14 @@ numbered `(2)`, `(3)`, and so on. Names can use the original media stem, append
 the transcript type, or add a custom suffix. Any combination of ScriptSync,
 Timecoded, SRT, and WebVTT can be produced in one pass.
 
+MLX Transcript accepts any local media file FFmpeg can read that contains an
+audio stream, whatever its filename. Folders are scanned recursively and each
+candidate file is probed with `ffprobe` in the background, so a clip with an
+unusual extension, or none at all, is queued as long as it holds audio. A
+short list of formats that cannot carry audio, such as PDFs, images and
+subtitle files, is skipped without probing as a fast path. Anything skipped is
+counted in the queue summary with a reason, so nothing is dropped silently.
+
 Drag media files or folders onto the Folders drop area or Queue to append them.
 Duplicate files are ignored. When a queue combines multiple source roots while
 using the source-tree layout, each root receives its own output folder so

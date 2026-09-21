@@ -47,6 +47,14 @@ class MediaInfo:
     start_timecode: str = ZERO_TIMECODE
     has_embedded_timecode: bool = False
     has_video: bool = False
+    #: How many streams ffprobe reported. Zero means it told us nothing about
+    #: the streams, which is not the same as "there is no audio".
+    stream_count: int = 0
+    #: True when at least one stream is audio. This, not the filename, is what
+    #: decides whether a file can be transcribed.
+    has_audio: bool = False
+    #: Codec of the first audio stream, for the skipped-files reasons.
+    audio_codec: str = ""
 
     @property
     def missing_timecode(self) -> bool:
@@ -136,6 +144,10 @@ def parse_probe_payload(payload: dict[str, Any], path: Path) -> MediaInfo:
         (stream for stream in streams if stream.get("codec_type") == "video"),
         None,
     )
+    audio = next(
+        (stream for stream in streams if stream.get("codec_type") == "audio"),
+        None,
+    )
 
     rate = _parse_rate(video) if video is not None else None
     # Only a timecode the converter can read counts as an embedded timecode.
@@ -155,6 +167,9 @@ def parse_probe_payload(payload: dict[str, Any], path: Path) -> MediaInfo:
         start_timecode=str(timecode) if timecode else ZERO_TIMECODE,
         has_embedded_timecode=bool(timecode),
         has_video=video is not None and rate is not None,
+        stream_count=len(streams),
+        has_audio=audio is not None,
+        audio_codec=str(audio.get("codec_name") or "") if audio else "",
     )
 
 
@@ -171,7 +186,7 @@ def probe_media(
         "-v", "error",
         "-show_entries",
         "format=duration:format_tags=timecode:"
-        "stream=codec_type,duration,avg_frame_rate,r_frame_rate:"
+        "stream=codec_type,codec_name,duration,avg_frame_rate,r_frame_rate:"
         "stream_tags=timecode",
         "-of", "json",
         str(source),
