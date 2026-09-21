@@ -283,13 +283,35 @@ def test_a_non_bash_shell_is_told_what_to_run():
 
 
 @pytest.mark.skipif(BASH is None, reason="bash is not installed")
+def fake_source_tree(tmp_path: Path) -> Path:
+    """A stand-in whose configure answers --list-muxers, so no download."""
+    tree = tmp_path / "ffmpeg-fake"
+    tree.mkdir()
+    configure = tree / "configure"
+    configure.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--list-muxers" ]; then\n'
+        '  printf "%s\\n" "pcm_s16le pcm_f32le wav null"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    configure.chmod(0o755)
+    return tree
+
+
+@pytest.mark.skipif(BASH is None, reason="bash is not installed")
 def test_reading_the_configure_flags_keeps_every_one(tmp_path):
     """The while-read loop must not lose the array to a subshell."""
     harness = tmp_path / "harness.sh"
-    body = re.search(
-        r"read_configure_args\(\) \{.*?\n\}", PREP.read_text(encoding="utf-8"), re.S
-    )
-    assert body, "read_configure_args could not be located"
+    source = PREP.read_text(encoding="utf-8")
+    bodies = [
+        re.search(rf"{name}\(\) \{{.*?\n\}}", source, re.S)
+        for name in ("read_configure_args", "assert_configure_args_are_clean")
+    ]
+    assert all(bodies), "the configure-argument functions could not be located"
+    tree = fake_source_tree(tmp_path)
     harness.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
@@ -299,8 +321,9 @@ def test_reading_the_configure_flags_keeps_every_one(tmp_path):
         f'requirements="{PROJECT_ROOT}/packaging/ffmpeg_requirements.py"\n'
         'ffmpeg_prefix=/tmp/mlx-harness\n'
         'mkdir -p build\n'
-        f"{body.group(0)}\n"
-        "read_configure_args\n"
+        + "\n".join(body.group(0) for body in bodies)
+        + "\n"
+        f'read_configure_args "{tree}"\n'
         'printf "%s\\n" "${#configure_args[@]}"\n',
         encoding="utf-8",
     )

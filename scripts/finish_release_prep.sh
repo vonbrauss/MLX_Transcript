@@ -156,13 +156,23 @@ stage_digests() {
 }
 
 read_configure_args() {
-    # Written to a file first and read back with a redirect, not a pipe. A
-    # pipe into "while read" runs the loop in a subshell in Bash, so the
-    # array would be empty by the time the caller saw it.
-    "$(python_bin)" "$requirements" --configure-args --prefix "$ffmpeg_prefix" \
+    # $1 is an unpacked FFmpeg source tree, so the muxer component names are
+    # resolved against that tree's own "configure --list-muxers" instead of
+    # being assumed. A raw PCM muxer's format name is s16le but its component
+    # is pcm_s16le, and asking for the format name enables nothing.
+    source_tree="${1:-}"
+    [ -n "$source_tree" ] || fail "read_configure_args needs a source tree."
+
+    "$(python_bin)" "$requirements" --configure-args \
+        --prefix "$ffmpeg_prefix" --source-tree "$source_tree" \
         > build/ffmpeg-configure-args.txt \
         || fail "Could not generate the configure flags from $requirements"
 
+    # Read back with a redirect, not a pipe: a pipe into "while read" runs the
+    # loop in a subshell in Bash, so the array would be empty by the time the
+    # caller saw it. read -r keeps backslashes literal rather than letting
+    # them escape the next character, so a flag cannot be silently reshaped
+    # between the file and configure.
     configure_args=()
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -171,6 +181,51 @@ read_configure_args() {
 
     [ "${#configure_args[@]}" -gt 0 ] \
         || fail "No configure flags were generated. See build/ffmpeg-configure-args.txt"
+
+    assert_configure_args_are_clean
+}
+
+assert_configure_args_are_clean() {
+    # Every argument has to begin with exactly two hyphens. A leading
+    # backslash is the specific damage this guards against: configure accepts
+    # "\--enable-muxer=s16le", warns once in a log thousands of lines long,
+    # and builds without the component. Nothing is compiled until this passes.
+    bad=0
+    index=0
+    while [ "$index" -lt "${#configure_args[@]}" ]; do
+        argument="${configure_args[$index]}"
+        case "$argument" in
+            "\\"*)
+                printf '!!! flag %s begins with a backslash: %s\n' \
+                    "$index" "$argument" >&2
+                bad=1
+                ;;
+            --?*) : ;;
+            *)
+                printf '!!! flag %s does not begin with --: %s\n' \
+                    "$index" "$argument" >&2
+                bad=1
+                ;;
+        esac
+        case "$argument" in
+            *"\\"*)
+                printf '!!! flag %s contains a backslash: %s\n' \
+                    "$index" "$argument" >&2
+                bad=1
+                ;;
+        esac
+        index=$((index + 1))
+    done
+
+    [ "$bad" -eq 0 ] || fail "Refusing to run configure with damaged flags."
+
+    # The arguments about to be passed to configure have to be byte-for-byte
+    # the lines in the recorded file, so the recorded file is evidence of what
+    # was actually used rather than a parallel guess.
+    printf '%s\n' ${configure_args[@]+"${configure_args[@]}"} \
+        > build/ffmpeg-configure-args.check.txt
+    cmp -s build/ffmpeg-configure-args.txt build/ffmpeg-configure-args.check.txt \
+        || fail "The loaded flags differ from build/ffmpeg-configure-args.txt. See build/ffmpeg-configure-args.check.txt"
 }
 
 stage_validate_ffmpeg() {
@@ -208,22 +263,50 @@ stage_ffmpeg() {
     # scrolled past in the build log, --disable-muxers won, and the app failed
     # on its first real clip with
     # "Requested output format 's16le' is not known."
-    read_configure_args
-    log "${#configure_args[@]} configure flags recorded in build/ffmpeg-configure-args.txt"
-
     work=$(mktemp -d /private/tmp/mlx-ffmpeg-build.XXXXXX) \
         || fail "Could not create a build directory."
     log "Building FFmpeg $ffmpeg_version in $work"
-    log "This takes 20 to 40 minutes. Output goes to build/ffmpeg-build.log"
-
-    jobs=$(sysctl -n hw.ncpu 2>/dev/null || printf '%s\n' 4)
 
     (
         cd "$work" || exit 1
         curl -LO "https://ffmpeg.org/releases/ffmpeg-${ffmpeg_version}.tar.xz" || exit 1
         tar xf "ffmpeg-${ffmpeg_version}.tar.xz" || exit 1
-        cd "ffmpeg-${ffmpeg_version}" || exit 1
+    ) 2>&1 | tee build/ffmpeg-fetch.log
+    tree="$work/ffmpeg-${ffmpeg_version}"
+    [ -f "$tree/configure" ] || fail "FFmpeg $ffmpeg_version did not unpack. See build/ffmpeg-fetch.log"
+
+    # Resolved against this exact source tree, then checked for damage. Both
+    # happen before configure runs, so a bad flag costs a second rather than a
+    # 40-minute build and a broken app.
+    read_configure_args "$tree"
+    log "${#configure_args[@]} configure flags recorded in build/ffmpeg-configure-args.txt"
+
+    log "This takes 20 to 40 minutes. Output goes to build/ffmpeg-build.log"
+    jobs=$(sysctl -n hw.ncpu 2>/dev/null || printf '%s\n' 4)
+
+    (
+        cd "$tree" || exit 1
         ./configure ${configure_args[@]+"${configure_args[@]}"} || exit 1
+    ) 2>&1 | tee build/ffmpeg-configure.log
+
+    # configure's own record of what it enabled, read out of the generated
+    # config.h. This is the gate the last build had no equivalent of: it
+    # noticed nothing, compiled for 40 minutes, installed, and only the first
+    # real clip revealed the muxers were missing.
+    log "Confirming the required muxers were enabled before compiling"
+    "$(python_bin)" "$requirements" --check-configured "$tree" \
+        2>&1 | tee build/ffmpeg-configured-muxers.txt
+    grep -q 'Safe to compile' build/ffmpeg-configured-muxers.txt \
+        || fail "configure did not enable the required muxers. See build/ffmpeg-configured-muxers.txt"
+
+    if grep -q 'did not match anything' build/ffmpeg-configure.log; then
+        printf '\n'
+        grep 'did not match anything' build/ffmpeg-configure.log >&2
+        fail "configure ignored a flag above. See build/ffmpeg-configure.log"
+    fi
+
+    (
+        cd "$tree" || exit 1
         make -j"$jobs" || exit 1
         make install || exit 1
     ) 2>&1 | tee build/ffmpeg-build.log

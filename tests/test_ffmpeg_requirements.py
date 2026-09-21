@@ -52,8 +52,9 @@ def test_every_required_encoder_has_its_own_flag():
 
 def test_every_required_muxer_has_its_own_flag():
     flags = req.configure_arguments()
+    components = req.resolve_muxer_components()
     for name in req.REQUIRED_MUXERS:
-        assert f"--enable-muxer={name}" in flags
+        assert f"--enable-muxer={components[name]}" in flags
 
 
 def test_every_required_filter_has_its_own_flag():
@@ -65,9 +66,9 @@ def test_every_required_filter_has_its_own_flag():
 def test_the_two_pcm_pairs_the_application_needs_are_present():
     """s16le for Whisper's audio loading, f32le for speaker detection."""
     flags = req.configure_arguments()
-    for encoder, muxer in (("pcm_s16le", "s16le"), ("pcm_f32le", "f32le")):
+    for encoder, component in (("pcm_s16le", "pcm_s16le"), ("pcm_f32le", "pcm_f32le")):
         assert f"--enable-encoder={encoder}" in flags
-        assert f"--enable-muxer={muxer}" in flags
+        assert f"--enable-muxer={component}" in flags
 
 
 def test_wav_and_null_muxers_are_available_for_validation():
@@ -193,8 +194,9 @@ def test_a_missing_muxer_is_reported_with_the_flag_that_fixes_it(monkeypatch):
 
     message = str(caught.value)
     assert "missing muxer s16le" in message
-    assert "--enable-muxer=s16le" in message
-    assert "--enable-muxer=f32le" in message
+    # The advice has to name the configure component, not the format name.
+    assert "--enable-muxer=pcm_s16le" in message
+    assert "--enable-muxer=pcm_f32le" in message
 
 
 def test_a_gpl_build_is_refused_by_the_validation(monkeypatch):
@@ -367,7 +369,7 @@ def test_the_documentation_lists_every_flag_explicitly():
 
     for name in req.REQUIRED_ENCODERS:
         assert f"--enable-encoder={name}" in text
-    for name in req.REQUIRED_MUXERS:
+    for name in req.resolve_muxer_components().values():
         assert f"--enable-muxer={name}" in text
     for name in req.REQUIRED_FILTERS:
         assert f"--enable-filter={name}" in text

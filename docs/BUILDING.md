@@ -39,10 +39,10 @@ source-distribution obligation on every release.
 MLX Transcript never encodes media, but it does need FFmpeg to hand it raw
 audio samples on a pipe, and it needs them in two different shapes:
 
-| Format | Encoder | Muxer | Who asks for it |
+| Format name | Encoder | Muxer component | Who asks for it |
 | --- | --- | --- | --- |
-| 16-bit signed integer | `pcm_s16le` | `s16le` | `mlx_whisper.load_audio`, on every clip |
-| 32-bit float | `pcm_f32le` | `f32le` | `transcription/diarization.py`, for speaker detection |
+| `s16le` | `pcm_s16le` | `pcm_s16le` | `mlx_whisper.load_audio`, on every clip |
+| `f32le` | `pcm_f32le` | `pcm_f32le` | `transcription/diarization.py`, for speaker detection |
 
 Both are *headerless*: the muxer writes nothing but samples, which is exactly
 what the two callers read. `wav` and `null` are enabled as well, because the
@@ -94,8 +94,8 @@ cd ffmpeg-7.1.1
   --disable-filters \
   --enable-encoder=pcm_s16le \
   --enable-encoder=pcm_f32le \
-  --enable-muxer=s16le \
-  --enable-muxer=f32le \
+  --enable-muxer=pcm_s16le \
+  --enable-muxer=pcm_f32le \
   --enable-muxer=wav \
   --enable-muxer=null \
   --enable-filter=aresample \
@@ -112,21 +112,68 @@ make -j"$(sysctl -n hw.ncpu)"
 make install
 ```
 
-**Every component is its own flag, and that matters.** FFmpeg's `configure`
-turns a comma-separated value into a shell `case` pattern and matches it
-against its component list, whose entries are named `s16le_muxer` and
-`f32le_muxer`. So this:
+Two things about those muxer flags are easy to get wrong, and FFmpeg reports
+neither in a way you would notice.
+
+**Use one flag per component.** `configure` turns a comma-separated value into a
+shell `case` pattern and matches it against its component list. So this:
 
 ```bash
 --enable-muxer=f32le,s16le,wav,null     # WRONG: matches nothing
 ```
 
 matches nothing at all, prints a single `did not match anything` warning that
-scrolls past in a long build log, and leaves `--disable-muxers` in force. Use
-one flag per component instead:
+scrolls past in a long build log, and leaves `--disable-muxers` in force.
+
+**A raw PCM muxer's component is not spelled like its format.** The format is
+`s16le`, which is what `-f s16le` takes and what `ffmpeg -muxers` prints, but
+the component `configure` knows is `pcm_s16le`. So this is also wrong:
 
 ```bash
---enable-muxer=f32le --enable-muxer=s16le --enable-muxer=wav --enable-muxer=null
+--enable-muxer=s16le --enable-muxer=f32le     # WRONG: matches nothing
+```
+
+It is accepted, adds two more `did not match anything` warnings, and enables
+nothing. `wav` and `null` happen to be spelled the same either way, which is
+why only the two PCM muxers went missing. Use the component names:
+
+```bash
+--enable-muxer=pcm_s16le --enable-muxer=pcm_f32le --enable-muxer=wav --enable-muxer=null
+```
+
+If you are unsure what a given FFmpeg calls a component, ask it:
+
+```bash
+./configure --list-muxers | tr ' ' '\n' | grep -E 'pcm|s16|f32'
+```
+
+That is what `scripts/finish_release_prep.sh ffmpeg` does. It unpacks the
+source, asks that tree's own `configure --list-muxers`, and generates the
+flags from the answer, so the recipe cannot be wrong about a tree it is
+actually looking at.
+
+### The three gates before a single object file is compiled
+
+`configure` exits 0 whether or not it understood your flags, so the build
+checks three things itself:
+
+1. **Every flag is well formed.** Each one begins with exactly `--` and
+   carries no backslash. A flag arriving as `\--enable-muxer=pcm_s16le` is
+   accepted by `configure` and ignored, so the script refuses to run
+   `configure` at all if it sees one, and it compares the loaded arguments
+   byte-for-byte against `build/ffmpeg-configure-args.txt`.
+2. **`configure`'s own output is read back.** The generated
+   `ffbuild/config.h` has to say `#define CONFIG_PCM_S16LE_MUXER 1` for every
+   required muxer. This is the check the first build had no equivalent of: it
+   noticed nothing, compiled for forty minutes, installed, and only the first
+   real clip revealed the muxers were missing.
+3. **Any `did not match anything` warning is fatal.** One ignored flag stops
+   the build rather than scrolling past.
+
+Run the second gate by hand against an already-configured tree with:
+
+```bash
+python3 packaging/ffmpeg_requirements.py --check-configured <ffmpeg source tree>
 ```
 
 Decoders, demuxers, parsers and protocols are all left enabled, which is what
