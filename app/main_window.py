@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QThread, QTimer, QUrl, Qt, Slot
+from PySide6.QtCore import (
+    QElapsedTimer,
+    QEvent,
+    QObject,
+    QThread,
+    QTimer,
+    QUrl,
+    Qt,
+    Slot,
+)
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -27,6 +38,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -49,6 +61,7 @@ from app.models import (
     QueueStatus,
     ReviewDecision,
     ReviewMode,
+    source_identity,
 )
 from app.collapsible import CollapsibleSection
 from app.power import SleepBlocker
@@ -63,13 +76,24 @@ from app.settings import (
     delete_user_preset,
 )
 from app.speaker_review import SpeakerReviewDialog
+from app.runtime import is_frozen, missing_component_message
 from app.widgets import ElidedLabel
+from transcription.discovery import (
+    MEDIA_EXTENSIONS,
+    MEDIA_NAME_FILTER,
+    is_supported_media,
+)
 from transcription.diarization import (
     SherpaOnnxDiarizer,
     SpeakerCountMode,
     backend_available,
 )
-from transcription.engine import MODEL_CHOICES, TranscriptionEngine
+from transcription.engine import (
+    MODEL_CHOICES,
+    TranscriptionEngine,
+    model_cache_root,
+    model_is_cached,
+)
 from transcription.media_probe import ffprobe_available, format_duration
 from transcription.model_cache import DEFAULT_BUNDLE, ModelCache, ModelState
 from transcription.outputs import FolderLayout, NameStyle, output_roots
@@ -77,16 +101,38 @@ from transcription.pipeline import BatchJob
 from transcription.presets import CleanupPreset, preset_values
 from transcription.speaker_presets import SpeakerPreset, preset_values as speaker_preset_values
 from transcription.timecode import TimecodeConverter
-from app.workers import ScanWorker, TranscriptionWorker
+from app.workers import ModelDownloadWorker, ScanWorker, TranscriptionWorker
 
 __all__ = ["MainWindow", "ConflictDialog"]
 
+logger = logging.getLogger(__name__)
+
 PRIVACY_TEXT = "Processing locally on this Mac"
+PRIVACY_DETAIL = (
+    "Your media never leaves this Mac. Models download once from Hugging Face "
+    "and are reused locally."
+)
 SPEAKER_TOOLTIP = (
     "Detect who is speaking, locally on this Mac. Transcripts gain Speaker 1, "
     "Speaker 2, and so on, which you can rename before they are written."
 )
 LOADING_MODEL_TEXT = "Downloading or loading model… the first run can take a while."
+
+#: Shown once, before the first Whisper model is fetched. The weights are a
+#: multi-gigabyte download and the progress bar cannot report on it, so the
+#: size and the destination are disclosed rather than discovered.
+WHISPER_DOWNLOAD_TITLE = "Download the transcription model?"
+WHISPER_DOWNLOAD_TEXT = (
+    "{label} has not been downloaded yet.\n\n"
+    "MLX Transcript will fetch it once from Hugging Face. These models are "
+    "several gigabytes, so the first run can take a while on a slow "
+    "connection, and the progress bar cannot show how far along it is.\n\n"
+    "It is cached in {folder} and reused offline from then on.\n\n"
+    + PRIVACY_DETAIL
+)
+FINISHING_TEXT = (
+    "Finishing the current file, then closing. Transcripts already written are safe."
+)
 
 
 def _set_tone(widget: QWidget, tone: str) -> None:
@@ -172,6 +218,18 @@ class MainWindow(QMainWindow):
         self._settings_save_timer.timeout.connect(self._save_current_settings)
         self._auto_save_connected = False
         self._scan_sources: list[Path] = []
+        # Duplicate detection reads from these rather than resolving the whole
+        # queue again for every file the scan finds.
+        self._queued_identities: set[Path] = set()
+        self._queued_roots: list[Path] = []
+        # Threads that have been asked to stop but may still be winding down.
+        # The window waits on these before it lets itself be destroyed.
+        self._live_threads: list[QThread] = []
+        self._closing = False
+        # Remembered so the progress bar can return from its indeterminate
+        # model-loading state to the real count.
+        self._batch_total = 0
+        self._batch_done = 0
 
         self.setWindowTitle("MLX Transcript")
         self.setMinimumSize(940, 560)
@@ -716,6 +774,17 @@ class MainWindow(QMainWindow):
         _set_tone(self.model_status_label, "secondary")
         outer.addWidget(self.model_status_label)
 
+        model_actions = QHBoxLayout()
+        self.check_models_button = QPushButton("Check or Repair Models")
+        self.check_models_button.setToolTip(
+            "Verify the cached speaker models and download them again if a "
+            "file is missing or damaged."
+        )
+        self.check_models_button.clicked.connect(self._check_or_repair_models)
+        model_actions.addWidget(self.check_models_button)
+        model_actions.addStretch(1)
+        outer.addLayout(model_actions)
+
         self.speaker_controls = (
             self.speaker_preset_picker,
             self.speaker_count_picker,
@@ -724,6 +793,7 @@ class MainWindow(QMainWindow):
             self.speakers_in_scriptsync,
             self.speakers_in_subtitles,
             self.speaker_advanced_toggle,
+            self.check_models_button,
             *self.speaker_setting_spins,
         )
         return group
@@ -920,10 +990,15 @@ class MainWindow(QMainWindow):
             "<p>Turn on <b>Detect speakers</b> only when you need speaker labels. "
             "If you know how many people are speaking, choose <b>Exact number</b> "
             "for more reliable results. Speaker models download once and then run locally.</p>"
+            "<h2>Privacy</h2>"
+            f"<p><b>{PRIVACY_DETAIL}</b> There is no cloud service, no analytics, and "
+            "no API key. The transcription model is fetched once on first use and "
+            "the speaker models are fetched once when you turn speaker detection "
+            "on. After that the application works offline.</p>"
             "<h2>Helpful notes</h2>"
-            "<p>Everything processes locally on this Mac. Existing output files follow the "
-            "choice in Transcription. Your latest settings are saved automatically. "
-            "You can cancel safely after the current file finishes.</p>"
+            "<p>Existing output files follow the choice in Transcription. Your "
+            "latest settings are saved automatically. You can cancel safely after "
+            "the current file finishes, and closing the window waits for it too.</p>"
         )
         layout.addWidget(help_text, stretch=1)
         self.help_text = help_text
@@ -955,6 +1030,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
 
         self.privacy_label = QLabel(PRIVACY_TEXT)
+        self.privacy_label.setToolTip(PRIVACY_DETAIL)
         privacy_font = QFont(self.privacy_label.font())
         privacy_font.setBold(True)
         self.privacy_label.setFont(privacy_font)
@@ -1245,13 +1321,44 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        """Persist settings, stop background work, and release the assertion."""
+        """Persist settings, stop background work, and release the assertion.
+
+        Closing while a batch runs never destroys the worker thread. The
+        window asks the batch to stop, shows that it is finishing the current
+        file, and closes itself once the worker reports back.
+        """
         self.settings = self._collect_settings()
         save_settings(self.settings)
+
+        if self.is_transcribing:
+            if not self._closing and not self._confirm_close_during_batch():
+                event.ignore()
+                return
+            self._closing = True
+            self._stop_batch()
+            self._enter_finishing_state()
+            event.ignore()
+            return
+
         self._stop_scan(wait=True)
-        self._stop_batch(wait=True)
+        self._wait_for_retiring_threads()
+        self._elapsed_timer.stop()
         self._sleep_blocker.release()
         super().closeEvent(event)
+
+    def _confirm_close_during_batch(self) -> bool:
+        """Ask whether to stop a running batch, since it cannot be closed instantly."""
+        answer = QMessageBox.question(
+            self,
+            "A batch is still running",
+            "Stop after the current file finishes and then quit?\n\n"
+            "Transcripts already written stay where they are. The file being "
+            "transcribed right now has to finish first, so this can take a "
+            "few minutes.",
+            QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Close
 
     # ----------------------------------------------------------------- paths
 
@@ -1291,8 +1398,7 @@ class MainWindow(QMainWindow):
             self,
             "Choose media file",
             start,
-            "Media files (*.aac *.aif *.aiff *.flac *.m4a *.m4v *.mkv *.mov "
-            "*.mp3 *.mp4 *.mpeg *.mpg *.ogg *.opus *.wav *.webm *.wma)",
+            MEDIA_NAME_FILTER,
         )
         if not chosen:
             return
@@ -1352,22 +1458,59 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ scan
 
+    def _is_covered(self, identity: Path) -> bool:
+        """True when a queued folder has already been scanned for this path."""
+        return any(
+            identity == root or root in identity.parents
+            for root in self._queued_roots
+        )
+
     def _queue_sources(self, sources: list[Path]) -> None:
-        """Append dropped or selected files and folders to the current queue."""
+        """Append dropped or selected files and folders to the current queue.
+
+        Three outcomes are kept apart, because they mean different things to
+        the person who just dropped something: a source that is not there at
+        all, a source already covered by the queue, and a source worth
+        scanning.
+        """
         if not sources or self.is_transcribing:
             return
-        existing = {self._source_identity(item.source) for item in self.items}
-        unique = []
+
+        missing: list[Path] = []
+        unsupported: list[Path] = []
+        duplicates: list[Path] = []
+        unique: list[Path] = []
+        pending: set[Path] = set()
         for source in sources:
             source = Path(source).expanduser()
-            identity = self._source_identity(source)
-            if identity in existing or not source.exists():
+            if not source.exists():
+                missing.append(source)
                 continue
-            existing.add(identity)
+            if source.is_file() and not is_supported_media(source):
+                unsupported.append(source)
+                continue
+            identity = source_identity(source)
+            if (
+                identity in self._queued_identities
+                or identity in pending
+                or self._is_covered(identity)
+            ):
+                duplicates.append(source)
+                continue
+            pending.add(identity)
             unique.append(source)
+
+        if missing:
+            self._report_missing_sources(missing)
+        if unsupported:
+            self._report_unsupported_sources(unsupported)
         if not unique:
-            self.statusBar().showMessage("Those media files are already in the queue.")
+            if duplicates and not missing and not unsupported:
+                self.statusBar().showMessage(
+                    "Those media files are already in the queue."
+                )
             return
+
         if self._scan_thread is not None and self._scan_thread.isRunning():
             self._stop_scan(wait=True)
 
@@ -1385,13 +1528,75 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._on_scan_failed)
         worker.finished.connect(self._on_scan_finished)
         worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        self._track_thread(thread, worker)
 
         self._scan_worker = worker
         self._scan_thread = thread
         self._scan_sources = unique
+        # A root only counts as covered once its scan has been started, so a
+        # cancelled scan does not silently block a later drop of the same
+        # folder.
+        for source in unique:
+            self._queued_roots.append(source_identity(source))
         thread.start()
         self._update_actions()
+
+    def _track_thread(self, thread: QThread, worker: QObject) -> None:
+        """Retire a worker thread cleanly once its event loop has stopped.
+
+        Both the worker and the thread are deleted by Qt, and the thread is
+        held in ``_live_threads`` until then so closing the window never
+        destroys a thread that is still running.
+        """
+        self._live_threads.append(thread)
+        thread.finished.connect(lambda: self._forget_thread(thread))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+    def _forget_thread(self, thread: QThread) -> None:
+        if thread in self._live_threads:
+            self._live_threads.remove(thread)
+
+    def _report_unsupported_sources(self, unsupported: list[Path]) -> None:
+        """Say which dropped files were not media, rather than dropping them silently."""
+        kinds = sorted({path.suffix.lower() or "(no extension)" for path in unsupported})
+        count = len(unsupported)
+        summary = (
+            f"{count} file(s) were skipped: {', '.join(kinds)} is not supported "
+            "media."
+            if count > 1
+            else f"{unsupported[0].name} was skipped: not a supported media file."
+        )
+        self.statusBar().showMessage(summary)
+        listed = "\n".join(path.name for path in unsupported[:12])
+        if count > 12:
+            listed += f"\n… and {count - 12} more"
+        QMessageBox.information(
+            self,
+            "Not supported media",
+            f"{summary}\n\n{listed}\n\n"
+            "MLX Transcript reads these audio and video containers:\n"
+            f"{', '.join(sorted(MEDIA_EXTENSIONS))}",
+        )
+
+    def _report_missing_sources(self, missing: list[Path]) -> None:
+        """Say which dropped items are not there, which is not the same as a duplicate."""
+        names = "\n".join(str(path) for path in missing)
+        summary = (
+            f"{len(missing)} item(s) could not be found and were not added."
+            if len(missing) > 1
+            else f"{missing[0].name} could not be found and was not added."
+        )
+        self.statusBar().showMessage(summary)
+        QMessageBox.warning(
+            self,
+            "Media not available",
+            "These items are not available right now, so nothing was added "
+            "for them:\n\n"
+            f"{names}\n\n"
+            "If they live on an external drive or a network volume, check "
+            "that it is still connected.",
+        )
 
     # Compatibility entry point for existing callers and manual path entry.
     def _start_scan(self) -> None:
@@ -1414,13 +1619,24 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.queue_summary.setText(f"Adding {total} media file(s)…")
 
+    def _add_item(self, item: QueueItem) -> bool:
+        """Append one scanned item unless its source is already queued.
+
+        Duplicate detection reads the identity the scan worker already
+        resolved and the set this window maintains, so adding a file costs the
+        same whether the queue holds ten items or ten thousand.
+        """
+        identity = item.resolved_identity
+        if identity in self._queued_identities:
+            return False
+        self._queued_identities.add(identity)
+        self.items.append(item)
+        self._append_row(item)
+        return True
+
     @Slot(int, object)
     def _on_item_ready(self, index: int, item: QueueItem) -> None:
-        if self._source_identity(item.source) not in {
-            self._source_identity(existing.source) for existing in self.items
-        }:
-            self.items.append(item)
-            self._append_row(item)
+        self._add_item(item)
         self.current_file_label.setText(item.name)
 
     @Slot(int, int)
@@ -1436,11 +1652,11 @@ class MainWindow(QMainWindow):
     @Slot(list)
     def _on_scan_finished(self, items: list) -> None:
         for item in items:
-            if self._source_identity(item.source) not in {
-                self._source_identity(existing.source) for existing in self.items
-            }:
-                self.items.append(item)
-                self._append_row(item)
+            self._add_item(item)
+        # Mixed source roots only gain their distinguishing labels once every
+        # item is in, so the Folder column is refreshed here rather than
+        # waiting for the next queue edit.
+        self._refresh_queue_source_labels()
         total = len(self.items)
         failures = sum(1 for item in self.items if item.status is QueueStatus.FAILED)
         seconds = sum(item.duration_seconds or 0.0 for item in self.items)
@@ -1452,7 +1668,17 @@ class MainWindow(QMainWindow):
         if failures:
             summary += f" {failures} could not be read."
         self.queue_summary.setText(summary)
-        self.statusBar().showMessage(summary if total else "No supported media found.")
+        if not items and self._scan_sources:
+            # The folder was readable, it simply held nothing this application
+            # can transcribe. Saying which folder is what makes that useful.
+            names = ", ".join(path.name for path in self._scan_sources[:3])
+            if len(self._scan_sources) > 3:
+                names += ", …"
+            self.statusBar().showMessage(f"No supported media found in {names}.")
+        else:
+            self.statusBar().showMessage(
+                summary if total else "No supported media found."
+            )
         self._scan_thread = None
         self._scan_worker = None
         self._scan_sources = []
@@ -1460,10 +1686,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _source_identity(path: Path) -> Path:
-        try:
-            return Path(path).resolve()
-        except OSError:
-            return Path(path).absolute()
+        """Kept as the window's own entry point onto the shared helper."""
+        return source_identity(path)
 
     # ----------------------------------------------------------------- queue
 
@@ -1514,6 +1738,7 @@ class MainWindow(QMainWindow):
             if 0 <= row < len(self.items):
                 del self.items[row]
                 self.queue_table.removeRow(row)
+        self._rebuild_queue_index()
         self._refresh_queue_summary()
         self._update_actions()
 
@@ -1523,8 +1748,25 @@ class MainWindow(QMainWindow):
             return
         self.items.clear()
         self.queue_table.setRowCount(0)
+        self._rebuild_queue_index()
         self._refresh_queue_summary()
         self._update_actions()
+
+    def _rebuild_queue_index(self) -> None:
+        """Recompute the duplicate index after the user edits the queue.
+
+        Removing entries has to give their sources back, so dropping the same
+        folder again scans it rather than reporting a duplicate. This runs
+        only on an explicit queue edit and reads identities that are already
+        resolved, so it stays proportional to the queue.
+        """
+        self._queued_identities = {item.resolved_identity for item in self.items}
+        roots: list[Path] = []
+        for item in self.items:
+            root = item.resolved_root_identity
+            if root not in roots:
+                roots.append(root)
+        self._queued_roots = roots
 
     @Slot()
     def _reveal_selected_source(self) -> None:
@@ -1555,7 +1797,7 @@ class MainWindow(QMainWindow):
     def _refresh_queue_source_labels(self) -> None:
         roots: list[Path] = []
         for item in self.items:
-            root = self._source_identity(item.source_root)
+            root = item.resolved_root_identity
             if root not in roots:
                 roots.append(root)
         labels: dict[Path, str] = {}
@@ -1567,7 +1809,7 @@ class MainWindow(QMainWindow):
                 labels[root] = base if used[base] == 1 else f"{base} ({used[base]})"
         for row, item in enumerate(self.items):
             item.extras["queue_root_label"] = labels.get(
-                self._source_identity(item.source_root), ""
+                item.resolved_root_identity, ""
             )
             if row < self.queue_table.rowCount():
                 self._refresh_row(row, item)
@@ -1629,7 +1871,7 @@ class MainWindow(QMainWindow):
         """Keep mixed source trees separate without changing file names."""
         roots = []
         for row in rows:
-            root = self._source_identity(self.items[row].source_root)
+            root = self.items[row].resolved_root_identity
             if root not in roots:
                 roots.append(root)
         if len(roots) <= 1:
@@ -1719,7 +1961,10 @@ class MainWindow(QMainWindow):
         state = self.model_state()
         if state is ModelState.UNAVAILABLE:
             detail = (
-                "sherpa-onnx is not installed. Run: pip install sherpa-onnx"
+                "A component this application ships with is missing. "
+                "Download the application again."
+                if is_frozen()
+                else "sherpa-onnx is not installed. Run: pip install sherpa-onnx"
             )
             tone = "warning"
         elif state is ModelState.READY:
@@ -1776,7 +2021,7 @@ class MainWindow(QMainWindow):
                 media=self.items[row].media,
                 source_root=self.items[row].source_root,
                 output_root_label=root_labels.get(
-                    self._source_identity(self.items[row].source_root)
+                    self.items[row].resolved_root_identity
                 ),
             )
             for row in rows
@@ -1784,7 +2029,12 @@ class MainWindow(QMainWindow):
         for row in rows:
             self._set_item_status(row, QueueStatus.WAITING)
 
-        if self.settings.detect_speakers and not self._confirm_model_download():
+        if not self._confirm_whisper_download():
+            for row in rows:
+                self._set_item_status(row, QueueStatus.READY)
+            return
+
+        if self.settings.detect_speakers and not self._prepare_speaker_models():
             for row in rows:
                 self._set_item_status(row, QueueStatus.READY)
             return
@@ -1814,11 +2064,13 @@ class MainWindow(QMainWindow):
         worker.review.connect(self._on_review)
         worker.finished.connect(self._on_batch_finished)
         worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
+        self._track_thread(thread, worker)
 
         self._batch_worker = worker
         self._batch_thread = thread
 
+        self._batch_total = len(jobs)
+        self._batch_done = 0
         self.progress_bar.setRange(0, len(jobs))
         self.progress_bar.setValue(0)
         self.current_file_label.setText(LOADING_MODEL_TEXT)
@@ -1835,27 +2087,60 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _stop_batch(self, wait: bool = False) -> None:
+        """Ask the batch to stop after the clip in flight finishes.
+
+        ``wait`` is deliberately not used while the window is closing. A clip
+        can take minutes, and blocking the main thread on it is what used to
+        end with a running thread being destroyed underneath Qt. The close
+        path now waits for the worker's own completion signal instead.
+        """
         if self._batch_worker is not None:
             self._batch_worker.cancel()
         thread = self._batch_thread
         if wait and thread is not None and thread.isRunning():
-            # quit() is queued behind the worker's run(), so the event loop
-            # exits as soon as the batch winds down rather than waiting for
-            # the finished signal to be delivered on a blocked main thread.
             thread.quit()
             thread.wait(30000)
+
+    def _wait_for_retiring_threads(self, milliseconds: int = 5000) -> None:
+        """Let already-stopped threads finish before the window is destroyed."""
+        for thread in list(self._live_threads):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(milliseconds)
+            except RuntimeError:
+                # Qt already deleted it, which is the outcome we wanted.
+                continue
+
+    def _enter_finishing_state(self) -> None:
+        """Show that the window is closing once the current file is done."""
+        self.statusBar().showMessage(FINISHING_TEXT)
+        self.current_file_label.setText(FINISHING_TEXT)
+        self.progress_bar.setRange(0, 0)
+        self.start_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
 
     @Slot(int, object)
     def _on_stage_changed(self, row: int, status: QueueStatus) -> None:
         self._set_item_status(row, status)
+        if self._closing:
+            # The window is waiting for this clip so it can close. Per-file
+            # activity would overwrite the message that explains the wait.
+            return
         if 0 <= row < len(self.items):
             name = self.items[row].name
             position = row + 1
             total = len(self.items)
             if status is QueueStatus.LOADING_MODEL:
                 activity = f"{LOADING_MODEL_TEXT} File {position} of {total}: {name}"
+                # There is no way to see inside the model download, so show a
+                # bar that is moving rather than one that looks stuck at zero.
+                self.progress_bar.setRange(0, 0)
             else:
                 activity = f"{status.label} — file {position} of {total}: {name}"
+                if self.progress_bar.maximum() == 0:
+                    self.progress_bar.setRange(0, max(self._batch_total, 1))
+                    self.progress_bar.setValue(self._batch_done)
             self.current_file_label.setText(activity)
             self.statusBar().showMessage(activity)
 
@@ -1865,6 +2150,12 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int)
     def _on_batch_progress(self, done: int, total: int) -> None:
+        self._batch_done = done
+        self._batch_total = total
+        if self._closing:
+            # Keep the indeterminate "finishing" bar rather than snapping back
+            # to a count the user is no longer waiting on.
+            return
         self.progress_bar.setRange(0, max(total, 1))
         self.progress_bar.setValue(done)
 
@@ -1878,9 +2169,11 @@ class MainWindow(QMainWindow):
             choice = ConflictDialog(source, list(existing), self).choice()
         except Exception:
             # The worker is blocked waiting for an answer, so it always gets
-            # one even if the dialog could not be shown.
+            # one even if the dialog could not be shown. Raising here would
+            # push the exception out through the Qt event loop instead.
+            logger.exception("The conflict dialog could not be shown")
             worker.provide_conflict_choice(ConflictChoice.CANCEL_BATCH)
-            raise
+            return
         worker.provide_conflict_choice(choice)
 
     @Slot(int, object, object)
@@ -1896,8 +2189,9 @@ class MainWindow(QMainWindow):
                 source, transcript, converter, self
             ).review()
         except Exception:
+            logger.exception("The speaker review dialog could not be shown")
             worker.provide_review_decision(ReviewDecision.CANCEL_BATCH)
-            raise
+            return
         worker.provide_review_decision(decision)
 
     def _converter_for(self, row: int) -> TimecodeConverter | None:
@@ -1912,8 +2206,35 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _confirm_whisper_download(self) -> bool:
+        """Disclose the first Whisper download before a batch triggers it.
+
+        Nothing is fetched here: MLX Whisper pulls the weights itself on the
+        first clip. What this adds is the one thing the progress bar cannot,
+        which is telling the user in advance that several gigabytes are about
+        to arrive and where they will live.
+        """
+        if model_is_cached(self.settings.model):
+            return True
+        answer = QMessageBox.question(
+            self,
+            WHISPER_DOWNLOAD_TITLE,
+            WHISPER_DOWNLOAD_TEXT.format(
+                label=self.settings.model_label,
+                folder=model_cache_root(),
+            ),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+        return answer == QMessageBox.StandardButton.Ok
+
     def _confirm_model_download(self) -> bool:
-        """Disclose the download before anything is fetched."""
+        """Disclose the download, then fetch the models before the batch starts.
+
+        Fetching here rather than inside the batch is deliberate: the download
+        gets a progress dialog the user can cancel, instead of appearing as a
+        transcription that has stopped responding.
+        """
         state = self.model_state()
         if state is ModelState.READY:
             return True
@@ -1921,9 +2242,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Speaker detection is unavailable",
-                "sherpa-onnx is not installed in this environment.\n\n"
-                "Install it with:  pip install sherpa-onnx\n\n"
-                "Transcription without speaker detection still works.",
+                missing_component_message("sherpa-onnx"),
             )
             return False
 
@@ -1939,6 +2258,121 @@ class MainWindow(QMainWindow):
         # Python object, so identity comparison can treat an OK click as Cancel.
         return answer == QMessageBox.StandardButton.Ok
 
+    def _prepare_speaker_models(self) -> bool:
+        """Get consent, then make sure the models are actually on disk."""
+        if not self._confirm_model_download():
+            return False
+        if self.model_state() is ModelState.READY:
+            return True
+        return self._download_models(repair=False)
+
+    @Slot()
+    def _check_or_repair_models(self) -> None:
+        """Verify the cached speaker models and offer to fetch them again."""
+        if self.model_state() is ModelState.UNAVAILABLE:
+            QMessageBox.warning(
+                self,
+                "Speaker detection is unavailable",
+                missing_component_message("sherpa-onnx"),
+            )
+            return
+
+        problems = self.model_cache.verify(DEFAULT_BUNDLE)
+        if not problems:
+            QMessageBox.information(
+                self,
+                "Speaker models are in order",
+                "Every cached model file is present and matches its expected "
+                f"contents.\n\nStored in:\n{self.model_cache.describe()}",
+            )
+            self._refresh_model_status()
+            return
+
+        listed = "\n".join(f"  {problem}" for problem in problems)
+        answer = QMessageBox.question(
+            self,
+            "Repair the speaker models?",
+            f"{len(problems)} model file(s) need attention:\n\n{listed}\n\n"
+            "Download them again? "
+            f"{DEFAULT_BUNDLE.disclosure()}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        if self._download_models(repair=True):
+            QMessageBox.information(
+                self,
+                "Speaker models repaired",
+                "The model files were downloaded again and verified.",
+            )
+
+    def _download_models(self, repair: bool = False) -> bool:
+        """Run the download on a thread behind a cancellable progress dialog."""
+        dialog = QProgressDialog(
+            "Preparing the speaker models…",
+            "Cancel",
+            0,
+            100,
+            self,
+        )
+        dialog.setWindowTitle(
+            "Repairing speaker models" if repair else "Downloading speaker models"
+        )
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+
+        worker = ModelDownloadWorker(self.model_cache, DEFAULT_BUNDLE, repair=repair)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        outcome: dict[str, object] = {"ok": False, "message": ""}
+
+        def on_progress(name: str, done: int, total: int) -> None:
+            if total > 0:
+                dialog.setMaximum(100)
+                dialog.setValue(min(100, int(100 * done / total)))
+            else:
+                # Length unknown, so show movement rather than a false figure.
+                dialog.setRange(0, 0)
+            dialog.setLabelText(
+                f"{name}: {done / (1024 * 1024):.1f} MB"
+                + (f" of {total / (1024 * 1024):.1f} MB" if total else "")
+            )
+
+        def on_finished(succeeded: bool, message: str) -> None:
+            outcome["ok"] = succeeded
+            outcome["message"] = message
+            thread.quit()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        # Direct, because the worker's thread is inside run() and will never
+        # reach its event loop to deliver a queued call. Cancelling only sets
+        # a flag the transfer reads, which is safe to do from here.
+        dialog.canceled.connect(worker.cancel, Qt.ConnectionType.DirectConnection)
+
+        thread.start()
+        while thread.isRunning():
+            QApplication.processEvents()
+            thread.wait(20)
+        dialog.close()
+        worker.deleteLater()
+        thread.deleteLater()
+
+        self._refresh_model_status()
+        if not outcome["ok"] and outcome["message"]:
+            QMessageBox.warning(
+                self,
+                "The speaker models are not ready",
+                f"{outcome['message']}\n\n"
+                "Transcription without speaker detection still works.",
+            )
+        return bool(outcome["ok"])
+
     @Slot(object)
     def _on_batch_finished(self, summary: BatchSummary) -> None:
         self.last_summary = summary
@@ -1949,6 +2383,12 @@ class MainWindow(QMainWindow):
         self._batch_worker = None
         finished = summary.as_sentence()
         self.statusBar().showMessage(finished)
+        if self._closing:
+            # The user asked to quit while this batch was in flight. The
+            # worker has now reported back, so the window can close without
+            # ever destroying a running thread.
+            self.close()
+            return
         self._update_actions()
         # _update_actions enables controls and may calculate readiness, but a
         # completed run should continue to show its result until the user

@@ -213,7 +213,9 @@ def test_starting_transcription_opens_the_queue_tab(window, monkeypatch, tmp_pat
             media=MediaInfo(path=source, duration_seconds=1.0),
         )
     ]
-    monkeypatch.setattr(window, "_confirm_model_download", lambda: False)
+    monkeypatch.setattr(window, "_prepare_speaker_models", lambda: False)
+    # The first-download disclosure is a separate consent step now.
+    monkeypatch.setattr(window, "_confirm_whisper_download", lambda: True)
     window._select_section("folders")
 
     window._start_transcription()

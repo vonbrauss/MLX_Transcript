@@ -7,29 +7,52 @@ responsive.
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Sequence
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.models import ConflictChoice, QueueItem, QueueStatus, ReviewDecision
+from app.models import (
+    ConflictChoice,
+    QueueItem,
+    QueueStatus,
+    ReviewDecision,
+    source_identity,
+)
 from transcription.diarization import DiarizationBackend, DiarizationOptions
 from transcription.discovery import discover_media
 from transcription.engine import TranscriptionEngine
 from transcription.media_probe import MediaProbeError, probe_media
+from transcription.model_cache import (
+    DEFAULT_BUNDLE,
+    DownloadCancelled,
+    ModelBundle,
+    ModelCache,
+    ModelCacheError,
+)
 from transcription.outputs import OutputOptions, build_output_paths, output_roots
 from transcription.pipeline import (
     BatchJob,
     BatchProcessor,
+    BatchSummary,
     ExistingFilePolicy,
     ItemOutcome,
     ItemStage,
     ReviewMode,
+    UNEXPECTED_ITEM_ERROR,
 )
 from transcription.speakers import SpeakerTranscript
 
-__all__ = ["ScanWorker", "TranscriptionWorker", "run_worker_on_thread"]
+__all__ = [
+    "ModelDownloadWorker",
+    "ScanWorker",
+    "TranscriptionWorker",
+    "run_worker_on_thread",
+]
+
+logger = logging.getLogger(__name__)
 
 
 class ScanWorker(QObject):
@@ -62,7 +85,23 @@ class ScanWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
-        """Scan, probe, and emit one :class:`QueueItem` per media file."""
+        """Scan, probe, and emit one :class:`QueueItem` per media file.
+
+        ``finished`` is emitted on every path, including an unexpected
+        failure, because the window uses it to retire the scan thread and to
+        put its controls back.
+        """
+        items: list[QueueItem] = []
+        try:
+            items = self._scan()
+        except Exception as error:  # noqa: BLE001 - the window must be told
+            logger.exception("The media scan failed")
+            self.failed.emit(f"The media scan could not finish: {error}")
+        finally:
+            self.finished.emit(items)
+
+    def _scan(self) -> list[QueueItem]:
+        """Do the scanning work and return everything that was queued."""
         self.started_scan.emit()
         items: list[QueueItem] = []
 
@@ -70,38 +109,45 @@ class ScanWorker(QObject):
         if self.output_parent is not None:
             excluded.append(output_roots(self.output_parent).transcription)
 
+        # Each discovered path is resolved exactly once, here, and the result
+        # travels on the QueueItem. The window then de-duplicates by that
+        # stored identity rather than resolving the whole queue again.
+        discovered: list[tuple[object, Path]] = []
         try:
-            discovered = []
             seen: set[Path] = set()
             for root in self.source_roots:
                 if not root.exists():
                     self.failed.emit(f"Source does not exist: {root}")
                     continue
                 for found in discover_media(root, excluded_roots=excluded):
-                    try:
-                        identity = found.path.resolve()
-                    except OSError:
-                        identity = found.path
+                    identity = source_identity(found.path)
                     if identity not in seen:
                         seen.add(identity)
-                        discovered.append(found)
+                        discovered.append((found, identity))
         except OSError as error:
             self.failed.emit(f"Could not read the source folder: {error}")
-            self.finished.emit(items)
-            return
+            return items
 
         total = len(discovered)
         self.found_files.emit(total)
 
-        for index, found in enumerate(discovered):
+        root_identities: dict[Path, Path] = {}
+        for index, (found, identity) in enumerate(discovered):
             if self._cancelled:
                 break
+
+            root_identity = root_identities.get(found.source_root)
+            if root_identity is None:
+                root_identity = source_identity(found.source_root)
+                root_identities[found.source_root] = root_identity
 
             item = QueueItem(
                 source=found.path,
                 source_root=found.source_root,
                 relative_folder=found.relative_folder,
                 status=QueueStatus.PROBING,
+                identity=identity,
+                root_identity=root_identity,
             )
             if self.output_parent is not None:
                 item.outputs = build_output_paths(
@@ -119,7 +165,61 @@ class ScanWorker(QObject):
             self.item_ready.emit(index, item)
             self.progress.emit(index + 1, total)
 
-        self.finished.emit(items)
+        return items
+
+
+class ModelDownloadWorker(QObject):
+    """Fetch the diarization models on a thread, with progress and cancel.
+
+    The download used to happen inside the batch, where it looked like a
+    transcription that had stalled. Doing it up front behind a progress dialog
+    means the user can see what is happening, and stop it.
+    """
+
+    progress = Signal(str, int, int)
+    finished = Signal(bool, str)
+
+    def __init__(
+        self,
+        cache: ModelCache,
+        bundle: ModelBundle = DEFAULT_BUNDLE,
+        repair: bool = False,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.cache = cache
+        self.bundle = bundle
+        self.repair = repair
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Ask the transfer to stop at the next chunk boundary."""
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self) -> None:
+        """Download or repair the bundle and report how it went."""
+        succeeded = False
+        message = ""
+        try:
+            fetch = self.cache.repair if self.repair else self.cache.ensure
+            fetch(
+                self.bundle,
+                progress=self.progress.emit,
+                cancelled=self.is_cancelled,
+            )
+            succeeded = True
+        except DownloadCancelled:
+            message = "Download cancelled."
+        except ModelCacheError as error:
+            message = str(error)
+        except Exception as error:  # noqa: BLE001 - the dialog must be told
+            logger.exception("The model download failed")
+            message = f"{type(error).__name__}: {error}"
+        finally:
+            self.finished.emit(succeeded, message)
 
 
 class TranscriptionWorker(QObject):
@@ -136,6 +236,11 @@ class TranscriptionWorker(QObject):
     conflict = Signal(int, object, object)
     review = Signal(int, object, object)
     finished = Signal(object)
+
+    #: How often a blocked worker re-checks whether the batch was cancelled
+    #: while it waits for a dialog answer. This is what stops a cancel that
+    #: lands between the pipeline's check and the wait from deadlocking.
+    ANSWER_POLL_SECONDS = 0.2
 
     def __init__(
         self,
@@ -203,9 +308,28 @@ class TranscriptionWorker(QObject):
         self._reviewed.set()
 
     def run(self) -> None:
-        """Process the batch and emit the summary."""
-        summary = self.processor.run(self.jobs)
-        self.finished.emit(summary)
+        """Process the batch and emit the summary.
+
+        ``finished`` is emitted exactly once on every path. The window uses it
+        to quit the thread, release the sleep assertion, and re-enable its
+        controls, so a worker that stopped without emitting would leave the
+        application permanently stuck in its running state.
+        """
+        summary: BatchSummary
+        try:
+            summary = self.processor.run(self.jobs)
+        except BaseException as error:  # noqa: BLE001 - the window must be told
+            logger.exception("The transcription batch failed")
+            summary = self._crash_summary(error)
+        finally:
+            self.finished.emit(summary)
+
+    def _crash_summary(self, error: BaseException) -> BatchSummary:
+        """Describe a batch that stopped for a reason the pipeline did not catch."""
+        message = f"{UNEXPECTED_ITEM_ERROR} ({type(error).__name__}): {error}"
+        summary = BatchSummary(failed=len(self.jobs))
+        summary.failures = [(job.source, message) for job in self.jobs]
+        return summary
 
     # -------------------------------------------------------------- plumbing
 
@@ -236,6 +360,19 @@ class TranscriptionWorker(QObject):
             0,
         )
 
+    def _await_answer(self, event: threading.Event) -> bool:
+        """Wait for a dialog answer, giving up if the batch is cancelled.
+
+        The wait is polled rather than unbounded. Cancelling sets the event so
+        an already-waiting worker wakes at once, but a cancel that arrives
+        just before the event is cleared would otherwise leave this thread
+        waiting for an answer nobody is going to give.
+        """
+        while not event.wait(self.ANSWER_POLL_SECONDS):
+            if self.processor.cancelled:
+                return False
+        return True
+
     def _ask_about_conflict(
         self,
         job: BatchJob,
@@ -245,7 +382,8 @@ class TranscriptionWorker(QObject):
         self._answered.clear()
         self._choice = ConflictChoice.SKIP_THIS
         self.conflict.emit(self._row_for(self._index_of(job)), job.source, list(existing))
-        self._answered.wait()
+        if not self._await_answer(self._answered):
+            return ConflictChoice.CANCEL_BATCH
         return self._choice
 
     def _ask_about_speakers(
@@ -261,7 +399,8 @@ class TranscriptionWorker(QObject):
         self._reviewed.clear()
         self._decision = ReviewDecision.CONTINUE
         self.review.emit(self._row_for(self._index_of(job)), job, transcript)
-        self._reviewed.wait()
+        if not self._await_answer(self._reviewed):
+            return ReviewDecision.CANCEL_BATCH
         return self._decision
 
 

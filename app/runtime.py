@@ -11,6 +11,7 @@ __all__ = [
     "apply_runtime_environment",
     "bundled_binary",
     "is_frozen",
+    "missing_component_message",
     "resource_root",
 ]
 
@@ -30,6 +31,30 @@ def bundled_binary(name: str) -> str:
     if candidate.is_file():
         return str(candidate)
     return shutil.which(name) or name
+
+
+def missing_component_message(package: str) -> str:
+    """Explain a missing component in terms the reader can act on.
+
+    Someone running from a checkout can install a package. Someone who
+    double-clicked the application cannot, and telling them to run ``pip``
+    sends them somewhere they cannot go: the component is meant to be inside
+    the bundle, so a bundle without it is a broken download.
+    """
+    if is_frozen():
+        return (
+            f"This copy of MLX Transcript is missing a component it ships with "
+            f"({package}).\n\n"
+            "Download the application again and replace this copy. If you "
+            "moved it out of a disk image, drag the whole application to your "
+            "Applications folder rather than copying part of it.\n\n"
+            "Transcription without speaker detection still works."
+        )
+    return (
+        f"{package} is not installed in this environment.\n\n"
+        f"Install it with:  pip install {package}\n\n"
+        "Transcription without speaker detection still works."
+    )
 
 
 def apply_runtime_environment() -> None:

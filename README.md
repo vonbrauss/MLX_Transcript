@@ -45,9 +45,18 @@ process and removes its abandoned lock immediately.
 
 ## Requirements
 
+Running the packaged application:
+
+- Apple silicon Mac running macOS 14 or later
+
+Nothing else. FFmpeg, MLX, and the speaker detection backend all travel inside
+the application bundle.
+
+Running from a checkout:
+
 - Apple silicon Mac running macOS 14 or later
 - Python 3.10 or newer (the bundled virtual environment uses 3.12)
-- FFmpeg, for `ffprobe`: `brew install ffmpeg`
+- FFmpeg, for `ffmpeg` and `ffprobe`: `brew install ffmpeg`
 
 ## Setup
 
@@ -74,9 +83,39 @@ python -m pip install -r requirements-build.txt
 scripts/build_macos.sh
 ```
 
-The versioned ZIP is written to `dist/`. Development builds are ad hoc signed
-and are not notarized. See `docs/BUILDING.md` for the Gatekeeper, signing, and
-FFmpeg distribution details.
+The versioned ZIP is written to `dist/`. The build verifies the archive it
+just wrote: it extracts it to a clean folder, confirms no AppleDouble files
+landed inside the bundle, re-checks the code signature on the extracted copy,
+runs the bundled `ffmpeg` and `ffprobe`, and runs the packaged engine check
+against a real MLX computation.
+
+Preview builds are ad hoc signed and are not notarized. See
+`docs/BUILDING.md` for signing and FFmpeg distribution details, and
+"Opening a preview build" below for what a downloader has to do.
+
+## Opening a preview build
+
+A preview build is signed ad hoc rather than with a Developer ID, and it is
+not notarized. macOS therefore refuses to open it on the first attempt, with
+a message about the application being damaged or from an unidentified
+developer. Nothing is wrong with the download; macOS is telling you it cannot
+verify who produced it.
+
+1. Unzip the archive in Finder by double-clicking it. Do not unzip it with a
+   third-party tool.
+2. Drag **MLX Transcript.app** to your Applications folder.
+3. Double-click it once. macOS will refuse and offer only **Done**.
+4. Open **System Settings → Privacy & Security**, scroll to the Security
+   section, and click **Open Anyway** next to the message about MLX
+   Transcript.
+5. Confirm with **Open**. macOS remembers the decision, so this is a one-time
+   step.
+
+On macOS 15 and later, right-clicking the application and choosing Open no
+longer bypasses this; the Privacy & Security step is the supported route.
+
+If you would rather not do any of that, run it from a checkout with
+`python main.py`, which Gatekeeper does not gate.
 
 From PyCharm, set the project interpreter to `.venv` and add a run
 configuration that points at `main.py` with the project root as the working
@@ -91,9 +130,11 @@ python -m pytest
 The tests cover timecode conversion, selectable output names and layouts,
 ScriptSync cleanup, SRT and WebVTT formatting, media discovery, ffprobe payload
 parsing, engine option construction, batch processing, conflict policy,
-cancellation, atomic writes, and the sleep assertion. None of them need FFmpeg,
-the model weights, MLX, or a display: the
-transcription engine is always a stand-in.
+cancellation, atomic writes, the sleep assertion, batch resilience, worker
+lifecycle, queue bookkeeping and its scaling, window shutdown during a batch,
+drag and drop onto both drop targets, and model download integrity. None of
+them need FFmpeg, the model weights, MLX, or a display: the transcription
+engine is always a stand-in.
 
 ## How it is put together
 
@@ -124,9 +165,19 @@ above.
 
 ## Privacy
 
-Transcription runs on this Mac. There is no cloud service, no analytics, no
-telemetry, and no API key. Model weights are downloaded once from Hugging Face
-the first time a model is selected, and media never leaves the machine.
+**Your media never leaves this Mac. Models download once from Hugging Face and
+are reused locally.**
+
+Transcription and speaker detection both run in this process on this machine.
+There is no cloud service, no analytics, no telemetry, and no API key. The
+only network traffic the application ever makes is fetching model files:
+
+- Whisper weights, on first use of a model, after the application tells you
+  how large the download is and where it will be cached.
+- The two speaker detection models, about 31 MB in total, only if you turn
+  speaker detection on and confirm the download.
+
+Both are verified before they are stored and reused offline from then on.
 
 ## Transcription
 
@@ -187,8 +238,18 @@ the output tree. After that they work offline. Install the backend with
 `pip install sherpa-onnx`; without it the section reports Unavailable and
 ordinary transcription is unaffected.
 
+## License
+
+MLX Transcript is free software licensed under the **GNU General Public
+License, version 3**. See `LICENSE` for the full text.
+
+The application bundle carries third-party components under their own
+licences, including LGPL-licensed Qt and FFmpeg. `THIRD_PARTY_NOTICES.md`
+lists every bundled component, its licence, and where to obtain its source.
+
 ## Status
 
 Milestones 1 to 3 are complete: the shell, discovery, probing, the queue, the
 transcription pipeline, conflict handling, cancellation, speaker detection,
-speaker review, frozen-process startup, navigation, and 449 tests.
+speaker review, frozen-process startup, and navigation. Run `python -m pytest`
+for the current test count rather than trusting a number written here.

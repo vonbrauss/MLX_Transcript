@@ -26,6 +26,7 @@ from transcription.pipeline import (
 )
 
 __all__ = [
+    "source_identity",
     "BatchSummary",
     "ConflictChoice",
     "ExistingFilePolicy",
@@ -37,6 +38,20 @@ __all__ = [
     "QueueItem",
     "SpeakerLabel",
 ]
+
+
+def source_identity(path: Path) -> Path:
+    """Return the canonical path used to tell two queue entries apart.
+
+    Resolving touches the filesystem, so every caller stores the result rather
+    than recomputing it. A path that cannot be resolved, which is what a
+    disconnected volume looks like, falls back to its absolute form so an
+    entry still compares equal to itself.
+    """
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(path).absolute()
 
 
 class QueueStatus(str, Enum):
@@ -135,10 +150,30 @@ class QueueItem:
     outputs: TranscriptPaths | None = None
     speakers: list[SpeakerLabel] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
+    #: Resolved form of :attr:`source`, filled in by the scan worker so the
+    #: queue never has to resolve the same path twice.
+    identity: Path | None = None
+    #: Resolved form of :attr:`source_root`, shared by every item from the
+    #: same scanned folder.
+    root_identity: Path | None = None
 
     @property
     def name(self) -> str:
         return self.source.name
+
+    @property
+    def resolved_identity(self) -> Path:
+        """The identity used for duplicate detection, resolved at most once."""
+        if self.identity is None:
+            self.identity = source_identity(self.source)
+        return self.identity
+
+    @property
+    def resolved_root_identity(self) -> Path:
+        """The identity of this item's source root, resolved at most once."""
+        if self.root_identity is None:
+            self.root_identity = source_identity(self.source_root)
+        return self.root_identity
 
     @property
     def relative_folder_label(self) -> str:

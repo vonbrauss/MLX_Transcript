@@ -3,11 +3,26 @@
 
 from pathlib import Path
 import os
+import re
 import shutil
+import subprocess
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, get_package_paths
 
 project = Path(SPEC).resolve().parents[1]
+
+
+def read_version_constant(name):
+    """Read one constant out of app/version.py without importing anything."""
+    source = (project / "app" / "version.py").read_text(encoding="utf-8")
+    found = re.search(rf'^{name} = "([^"]+)"', source, re.MULTILINE)
+    if found is None:
+        raise SystemExit(f"app/version.py does not define {name}")
+    return found.group(1)
+
+
+VERSION = read_version_constant("VERSION")
+BUILD_NUMBER = read_version_constant("BUILD_NUMBER")
 
 datas = []
 datas.append((str(project / "app" / "assets"), "app/assets"))
@@ -103,14 +118,78 @@ hiddenimports += [
 
 hiddenimports = sorted(set(hiddenimports))
 
-# Local development builds may bundle Homebrew FFmpeg. Public releases must
-# satisfy the license obligations of the exact FFmpeg build being distributed.
+# --------------------------------------------------------------------- FFmpeg
+#
+# MLX Transcript only ever demuxes, probes, and decodes audio. It encodes
+# nothing, so it never needs the GPL encoders a stock Homebrew FFmpeg enables.
+# Bundling that build anyway would put a source-distribution obligation on
+# every release, so the configuration is inspected here and a GPL build is
+# refused unless the person building says otherwise in as many words.
+
+GPL_CONFIGURE_FLAGS = ("--enable-gpl", "--enable-nonfree")
+
+
+def ffmpeg_configuration(executable):
+    """Return the configure line the located FFmpeg reports, or an empty string."""
+    try:
+        result = subprocess.run(
+            [executable, "-version"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in (result.stdout or "").splitlines():
+        if line.strip().startswith("configuration:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def gpl_flags_in(configuration):
+    return [flag for flag in GPL_CONFIGURE_FLAGS if flag in configuration]
+
+
+def record_media_tool_provenance(entries):
+    """Write what was bundled so the notices can describe the real binary."""
+    report = project / "build" / "ffmpeg-configuration.txt"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        "\n\n".join(f"{name}: {path}\nconfiguration: {configuration}"
+                    for name, path, configuration in entries)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 if os.environ.get("MLX_TRANSCRIPT_BUNDLE_FFMPEG", "1") == "1":
+    allow_gpl = os.environ.get("MLX_TRANSCRIPT_ALLOW_GPL_FFMPEG") == "1"
+    provenance = []
     for executable in ("ffmpeg", "ffprobe"):
-        located = shutil.which(executable)
+        located = os.environ.get(f"MLX_TRANSCRIPT_{executable.upper()}") or shutil.which(
+            executable
+        )
         if not located:
-            raise SystemExit(f"{executable} was not found; install FFmpeg or set MLX_TRANSCRIPT_BUNDLE_FFMPEG=0")
+            raise SystemExit(
+                f"{executable} was not found; install FFmpeg, point "
+                f"MLX_TRANSCRIPT_{executable.upper()} at one, or set "
+                "MLX_TRANSCRIPT_BUNDLE_FFMPEG=0"
+            )
+        configuration = ffmpeg_configuration(located)
+        offending = gpl_flags_in(configuration)
+        if offending and not allow_gpl:
+            raise SystemExit(
+                f"\nRefusing to bundle {located}.\n"
+                f"It was built with {' '.join(offending)}, which makes the "
+                "binary GPL and puts a source-distribution obligation on every "
+                "release.\n\n"
+                "MLX Transcript only decodes and probes, so it does not need "
+                "those components. Build or install an FFmpeg configured with "
+                "--disable-gpl --disable-nonfree and point "
+                "MLX_TRANSCRIPT_FFMPEG / MLX_TRANSCRIPT_FFPROBE at it.\n\n"
+                "Set MLX_TRANSCRIPT_ALLOW_GPL_FFMPEG=1 to override for a local "
+                "build that will not be published.\n"
+            )
         binaries.append((located, "bin"))
+        provenance.append((executable, located, configuration))
+    record_media_tool_provenance(provenance)
 
 a = Analysis(
     [str(project / "main.py")],
@@ -127,6 +206,7 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
+icon_path = project / "packaging" / "MLX Transcript.icns"
 exe = EXE(
     pyz,
     a.scripts,
@@ -139,6 +219,7 @@ exe = EXE(
     upx=False,
     console=False,
     target_arch="arm64",
+    icon=str(icon_path) if icon_path.is_file() else None,
 )
 coll = COLLECT(
     exe,
@@ -151,12 +232,13 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="MLX Transcript.app",
+    icon=str(icon_path) if icon_path.is_file() else None,
     bundle_identifier="com.vonbrauss.mlxtranscript",
     info_plist={
         "CFBundleDisplayName": "MLX Transcript",
         "CFBundleName": "MLX Transcript",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": BUILD_NUMBER,
         "LSMinimumSystemVersion": "14.0",
         "LSApplicationCategoryType": "public.app-category.productivity",
         "NSHighResolutionCapable": True,
