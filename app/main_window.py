@@ -1824,6 +1824,8 @@ class MainWindow(QMainWindow):
         panel.table.itemSelectionChanged.connect(
             lambda bound=panel: self._on_panel_selection_changed(bound)
         )
+        # Fires at the moment Qt's own view would have edited the rows.
+        panel.table.drag_finished.connect(self._ensure_views_match_queue)
         panel.remove_button.clicked.connect(self._remove_selected_items)
         panel.clear_button.clicked.connect(self._clear_queue)
         panel.reveal_button.clicked.connect(self._reveal_selected_source)
@@ -1942,31 +1944,70 @@ class MainWindow(QMainWindow):
         self._refresh_queue_summary()
         self._update_actions()
 
-    def _move_queue_rows(self, rows, target: int) -> bool:
+    def _planned_move(self, rows, target) -> tuple[list[int], int] | None:
+        """Work out both indices up front, or refuse the move.
+
+        Nothing is touched here. Every way a drop can be nonsense, an index
+        that is not a number, a row that is not in the queue, a destination
+        past its end, is settled before the queue is rewritten, so a bad drop
+        leaves the queue exactly as it was rather than half moved.
+        """
+        total = len(self.items)
+        try:
+            moving_rows = sorted({int(row) for row in rows})
+            destination = int(target)
+        except (TypeError, ValueError):
+            return None
+        if not moving_rows:
+            return None
+        if moving_rows[0] < 0 or moving_rows[-1] >= total:
+            return None
+        # ``total`` itself is valid: it means below the final row.
+        if not 0 <= destination <= total:
+            return None
+        insert_at = destination - sum(1 for row in moving_rows if row < destination)
+        return moving_rows, insert_at
+
+    def _move_queue_rows(self, rows, target) -> bool:
         """Move ``rows`` so they sit immediately before ``target``.
 
-        ``items`` is the authoritative order, so it is what moves. Both views
-        are redrawn from it and the batch reads it directly, which is how a
-        reorder reaches transcription without a second list to keep in step.
+        One computation, one assignment, one redraw. ``items`` is the
+        authoritative order, so it is the only thing that moves; both views
+        are then drawn from it and the batch reads it directly. No table ever
+        edits its own rows, which is what a dragged clip disappearing used to
+        be.
         """
         if self.is_transcribing:
             return False
-        moving_rows = sorted(
-            {int(row) for row in rows if 0 <= int(row) < len(self.items)}
-        )
-        if not moving_rows:
+        planned = self._planned_move(rows, target)
+        if planned is None:
             return False
-        target = max(0, min(int(target), len(self.items)))
-        moving = [self.items[row] for row in moving_rows]
+        moving_rows, insert_at = planned
+
         chosen = set(moving_rows)
+        moving = [self.items[row] for row in moving_rows]
         remaining = [
             item for row, item in enumerate(self.items) if row not in chosen
         ]
-        insert_at = target - sum(1 for row in moving_rows if row < target)
         reordered = remaining[:insert_at] + moving + remaining[insert_at:]
+
+        # A reorder is a permutation and nothing else. If this ever fails the
+        # queue is left alone, because losing somebody's clip is far worse
+        # than refusing to move it.
+        if len(reordered) != len(self.items) or {
+            id(item) for item in reordered
+        } != {id(item) for item in self.items}:
+            logger.error(
+                "Refusing a queue reorder that was not a permutation: "
+                "%d items in, %d out",
+                len(self.items),
+                len(reordered),
+            )
+            return False
         if all(new is old for new, old in zip(reordered, self.items)):
             return False
 
+        # The single assignment. Everything below reads from it.
         self.items = reordered
         # Identities and source roots travel with their items, so a move
         # changes neither duplicate detection nor where anything is written.
@@ -1983,6 +2024,23 @@ class MainWindow(QMainWindow):
             f"Moved {names} to position {insert_at + 1} in the Media queue."
         )
         return True
+
+    @Slot()
+    def _ensure_views_match_queue(self) -> None:
+        """Redraw if a table's rows have drifted from the queue.
+
+        Nothing should be able to add or remove a row behind the window's
+        back now that the tables run their own drags. A queue that quietly
+        lost a clip is the worst thing this panel can do, though, so it is
+        checked rather than assumed.
+        """
+        if any(
+            panel.row_count() != len(self.items) for panel in self._queue_panels
+        ):
+            logger.warning(
+                "A queue view drifted from the queue; redrawing from items"
+            )
+            self._rebuild_queue_rows(select=self._selected_queue_rows())
 
     def _rebuild_queue_index(self) -> None:
         """Recompute the duplicate index after the user edits the queue.
@@ -2202,7 +2260,11 @@ class MainWindow(QMainWindow):
                 panel.hide_insertion()
                 if not self.is_transcribing and panel.reorder_enabled:
                     self._move_queue_rows(self._selected_queue_rows(), target)
-                event.acceptProposedAction()
+                # Never acceptProposedAction here. The proposed action on an
+                # internal drag is Move, and a Move result is Qt's cue to
+                # delete the rows it thinks it gave away.
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
                 return True
             return None
         return None

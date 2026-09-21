@@ -43,7 +43,9 @@ from app.main_window import (  # noqa: E402
     MEDIA_EMPTY_TITLE,
     MainWindow,
 )
+from app import queue_panel as queue_panel_module  # noqa: E402
 from app.models import QueueItem, QueueStatus  # noqa: E402
+from app.queue_panel import QueueTable  # noqa: E402
 from app.settings import AppSettings  # noqa: E402
 from transcription.media_probe import MediaInfo  # noqa: E402
 from transcription.pipeline import BatchSummary  # noqa: E402
@@ -110,10 +112,12 @@ def internal_row_mime() -> QMimeData:
     return mime
 
 
-def send_drag_enter(window, target, mime, point=(10, 10)) -> QDragEnterEvent:
+def send_drag_enter(
+    window, target, mime, point=(10, 10), action=Qt.DropAction.CopyAction
+) -> QDragEnterEvent:
     event = QDragEnterEvent(
         QPointF(*point).toPoint(),
-        Qt.DropAction.CopyAction,
+        action,
         mime,
         Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier,
@@ -122,10 +126,12 @@ def send_drag_enter(window, target, mime, point=(10, 10)) -> QDragEnterEvent:
     return event
 
 
-def send_drop(window, target, mime, point=(10, 10)) -> QDropEvent:
+def send_drop(
+    window, target, mime, point=(10, 10), action=Qt.DropAction.CopyAction
+) -> QDropEvent:
     event = QDropEvent(
         QPointF(*point),
-        Qt.DropAction.CopyAction,
+        action,
         mime,
         Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier,
@@ -732,3 +738,362 @@ def test_a_drop_on_the_dedicated_queue_still_queues(
 
 def test_an_unrelated_event_still_passes_through(window):
     assert window.eventFilter(window.drop_target, QEvent(QEvent.Type.Show)) is False
+
+
+# ------------------------------------------------- reordering never loses a row
+
+"""Regression cover for a dragged row disappearing from the queue.
+
+``QAbstractItemView.startDrag`` finishes with ``if (drag->exec(...) ==
+Qt::MoveAction) d->clearOrRemove();``, and ``clearOrRemove`` removes the
+selected rows from the model. The drop had already been handled and the queue
+already redrawn by then, so a clip dragged to a new position was reordered
+correctly and then deleted from the table it came from. It needed a real
+mouse, because ``drag->exec`` cannot return ``MoveAction`` without one, which
+is why nothing here caught it.
+
+These pin the two halves of the fix: the table never calls up to that branch,
+and the reorder itself is one validated permutation of ``items`` that either
+happens completely or not at all.
+"""
+
+
+@pytest.fixture
+def queued(window, application, tmp_path):
+    """A four-file queue, added the way a person adds one."""
+    queue_clips(
+        window, application, tmp_path / "Day1", ["a.mov", "b.mov", "c.mov", "d.mov"]
+    )
+    assert names(window) == ["a.mov", "b.mov", "c.mov", "d.mov"]
+    return window
+
+
+def assert_queue_is_intact(window, expected_names: list[str]) -> None:
+    """Every item present exactly once, in order, in the list and both views."""
+    assert names(window) == expected_names
+    # Exactly once: identity, not equality, so two items that merely look
+    # alike cannot stand in for each other.
+    identities = [id(item) for item in window.items]
+    assert len(set(identities)) == len(identities) == len(expected_names)
+    assert column(window.media_queue_panel) == expected_names
+    assert column(window.queue_panel) == expected_names
+    assert window.media_queue_panel.table.rowCount() == len(expected_names)
+    assert window.queue_panel.table.rowCount() == len(expected_names)
+
+
+# ---------------------------------------------------------- every direction
+
+
+def test_the_first_row_moves_to_last(queued):
+    assert queued._move_queue_rows([0], 4) is True
+
+    assert_queue_is_intact(queued, ["b.mov", "c.mov", "d.mov", "a.mov"])
+
+
+def test_the_last_row_moves_to_first(queued):
+    assert queued._move_queue_rows([3], 0) is True
+
+    assert_queue_is_intact(queued, ["d.mov", "a.mov", "b.mov", "c.mov"])
+
+
+def test_a_middle_row_moves_up(queued):
+    assert queued._move_queue_rows([2], 1) is True
+
+    assert_queue_is_intact(queued, ["a.mov", "c.mov", "b.mov", "d.mov"])
+
+
+def test_a_middle_row_moves_down(queued):
+    assert queued._move_queue_rows([1], 3) is True
+
+    assert_queue_is_intact(queued, ["a.mov", "c.mov", "b.mov", "d.mov"])
+
+
+def test_a_row_moves_to_the_very_top(queued):
+    assert queued._move_queue_rows([2], 0) is True
+
+    assert_queue_is_intact(queued, ["c.mov", "a.mov", "b.mov", "d.mov"])
+
+
+def test_a_row_moves_between_two_others(queued):
+    assert queued._move_queue_rows([0], 3) is True
+
+    assert_queue_is_intact(queued, ["b.mov", "c.mov", "a.mov", "d.mov"])
+
+
+def test_a_row_moves_below_the_final_row(queued):
+    """The destination equal to the queue length means past the last row."""
+    assert queued._move_queue_rows([1], len(queued.items)) is True
+
+    assert_queue_is_intact(queued, ["a.mov", "c.mov", "d.mov", "b.mov"])
+
+
+def test_moving_one_row_preserves_every_other_row(queued):
+    before = {item.name: item for item in queued.items}
+
+    queued._move_queue_rows([1], 4)
+
+    assert {item.name: item for item in queued.items} == before
+    assert_queue_is_intact(queued, ["a.mov", "c.mov", "d.mov", "b.mov"])
+
+
+def test_every_item_survives_a_run_of_reorders(queued):
+    """Whatever order they end in, the same four objects have to be there."""
+    original = {id(item) for item in queued.items}
+
+    for rows, destination in (([0], 4), ([3], 0), ([1], 3), ([2], 1), ([0], 2)):
+        queued._move_queue_rows(rows, destination)
+        assert {id(item) for item in queued.items} == original
+        assert len(queued.items) == 4
+        assert column(queued.media_queue_panel) == names(queued)
+        assert column(queued.queue_panel) == names(queued)
+
+
+# ------------------------------------------------------------ invalid drops
+
+
+@pytest.mark.parametrize(
+    "rows, destination",
+    [
+        ([], 0),              # nothing selected
+        ([9], 0),             # a row that is not in the queue
+        ([-1], 0),            # a row before the first
+        ([0], -1),            # a destination before the first
+        ([0], 99),            # a destination past the end
+        ([0, 9], 1),          # one good row and one that is not
+        (["x"], 0),           # not an index at all
+        ([0], None),          # no destination at all
+    ],
+)
+def test_an_invalid_drop_leaves_the_queue_unchanged(queued, rows, destination):
+    before = list(queued.items)
+
+    assert queued._move_queue_rows(rows, destination) is False
+
+    assert queued.items == before
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+def test_a_move_onto_its_own_position_changes_nothing(queued):
+    before = list(queued.items)
+
+    assert queued._move_queue_rows([1], 1) is False
+    assert queued._move_queue_rows([1], 2) is False
+
+    assert queued.items == before
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+def test_a_reorder_keeps_status_source_and_duration(queued):
+    before = {
+        item.name: (item.status, item.source, item.duration_label)
+        for item in queued.items
+    }
+    queued._set_item_status(0, QueueStatus.COMPLETED)
+    completed = queued.items[0]
+
+    queued._move_queue_rows([0], 4)
+
+    assert completed.status is QueueStatus.COMPLETED
+    assert queued.items[-1] is completed
+    for item in queued.items:
+        status, source, duration = before[item.name]
+        assert item.source == source
+        assert item.duration_label == duration
+        if item is not completed:
+            assert item.status is status
+    row = queued.items.index(completed)
+    assert queued.media_queue_panel.table.item(row, 3).text() == "Completed"
+    assert queued.queue_panel.table.item(row, 3).text() == "Completed"
+
+
+# --------------------------------------------- the table never edits itself
+
+
+class RecordingDrag:
+    """Stands in for QDrag so a drag can be started without a mouse."""
+
+    started: list[tuple] = []
+
+    def __init__(self, parent=None):
+        self._mime = None
+
+    def setMimeData(self, data):  # noqa: N802 - Qt naming
+        self._mime = data
+
+    def exec(self, *actions):
+        RecordingDrag.started.append(actions)
+        return Qt.DropAction.CopyAction
+
+    exec_ = exec
+
+
+def test_the_queue_table_does_not_use_qts_row_removing_drag():
+    """The exact branch that deleted the dragged row must be unreachable."""
+    from PySide6.QtWidgets import QTableWidget
+
+    assert QueueTable.startDrag is not QTableWidget.startDrag
+
+
+def test_starting_a_drag_removes_nothing(queued, monkeypatch):
+    from PySide6.QtWidgets import QTableWidget
+
+    panel = queued.media_queue_panel
+    # Fail here rather than hand a real drag loop to an offscreen test.
+    assert type(panel.table).startDrag is not QTableWidget.startDrag
+
+    RecordingDrag.started.clear()
+    monkeypatch.setattr(queue_panel_module, "QDrag", RecordingDrag)
+    panel.table.selectRow(1)
+
+    panel.table.startDrag(Qt.DropAction.MoveAction)
+
+    assert RecordingDrag.started, "no drag was started"
+    # Copy on both counts: a Move result is Qt's cue to delete the source rows.
+    for actions in RecordingDrag.started:
+        assert Qt.DropAction.MoveAction not in actions
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+def test_a_drag_that_ends_reconciles_the_views(queued):
+    """The moment Qt used to edit rows is the moment the views are checked."""
+    panel = queued.media_queue_panel
+    # Simulate a stray row removal, which is what the old code suffered.
+    panel.table.removeRow(2)
+    assert panel.table.rowCount() == 3
+
+    panel.table.drag_finished.emit()
+
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+def test_a_dropped_row_does_not_disappear(queued, application):
+    """The reported bug, driven through the real drop path."""
+    queued.show()
+    application.processEvents()
+    panel = queued.media_queue_panel
+    panel.table.selectRow(0)
+    application.processEvents()
+
+    mime = internal_row_mime()
+    bottom = panel.table.viewport().height()
+    proposed = Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+    send_drag_enter(
+        queued, panel.table.viewport(), mime, point=(10, bottom), action=proposed
+    )
+    send_drop(
+        queued, panel.table.viewport(), mime, point=(10, bottom), action=proposed
+    )
+    # Qt removed the source rows at exactly this point. Now it cannot, and
+    # the views are reconciled against the queue instead.
+    panel.table.drag_finished.emit()
+
+    assert_queue_is_intact(queued, ["b.mov", "c.mov", "d.mov", "a.mov"])
+
+
+def test_the_drag_this_table_starts_can_never_report_a_move(
+    queued, monkeypatch
+):
+    """Move is the only result Qt acts on, so it is never offered.
+
+    ``drag->exec`` returns one of the actions it was given. This table offers
+    Copy alone, so the ``== Qt::MoveAction`` branch that removed the source
+    rows cannot be reached whatever the drop does.
+
+    Asserting on a synthetic ``QDropEvent`` instead would prove nothing:
+    ``setDropAction`` is ignored unless the action is among the event's
+    possible ones, and whenever Copy is possible Qt already proposes it, so
+    accepting the proposal and setting Copy are indistinguishable there. The
+    guarantee lives at the drag's source, which is where this looks.
+    """
+    RecordingDrag.started.clear()
+    monkeypatch.setattr(queue_panel_module, "QDrag", RecordingDrag)
+    queued.media_queue_panel.table.selectRow(0)
+
+    queued.media_queue_panel.table.startDrag(
+        Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+    )
+
+    assert RecordingDrag.started, "no drag was started"
+    for actions in RecordingDrag.started:
+        assert Qt.DropAction.MoveAction not in actions
+        assert Qt.DropAction.CopyAction in actions
+
+
+def test_an_internal_drop_is_accepted_and_keeps_the_queue_whole(
+    queued, application
+):
+    """Whatever action Qt proposes, the drop reorders and loses nothing."""
+    queued.show()
+    application.processEvents()
+    panel = queued.media_queue_panel
+    panel.table.selectRow(0)
+
+    mime = internal_row_mime()
+    proposed = Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+    send_drag_enter(
+        queued, panel.table.viewport(), mime, point=(10, 0), action=proposed
+    )
+    event = send_drop(
+        queued, panel.table.viewport(), mime, point=(10, 0), action=proposed
+    )
+
+    assert event.isAccepted()
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+# ------------------------------------------ the rest of the queue's behaviour
+
+
+def test_a_finder_drop_appends_without_disturbing_the_order(
+    queued, application, tmp_path
+):
+    queued._move_queue_rows([3], 0)
+    assert names(queued) == ["d.mov", "a.mov", "b.mov", "c.mov"]
+
+    queue_clips(queued, application, tmp_path / "Day2", ["e.mov"])
+
+    assert_queue_is_intact(
+        queued, ["d.mov", "a.mov", "b.mov", "c.mov", "e.mov"]
+    )
+
+
+def test_reordering_stays_disabled_while_processing(queued):
+    original = MainWindow.is_transcribing
+    try:
+        MainWindow.is_transcribing = property(lambda self: True)
+        queued._update_actions()
+
+        assert queued._move_queue_rows([0], 4) is False
+    finally:
+        MainWindow.is_transcribing = original
+
+    assert_queue_is_intact(queued, ["a.mov", "b.mov", "c.mov", "d.mov"])
+
+
+def test_processing_follows_the_reordered_queue(
+    queued, application, monkeypatch
+):
+    """The batch reads items, so the revised order is the order it runs."""
+    queued._move_queue_rows([3], 0)
+    queued._move_queue_rows([3], 1)
+    assert names(queued) == ["d.mov", "c.mov", "a.mov", "b.mov"]
+
+    RecordingWorker.captured.clear()
+    monkeypatch.setattr(main_window_module, "TranscriptionWorker", RecordingWorker)
+    monkeypatch.setattr(main_window_module, "model_is_cached", lambda _model: True)
+    monkeypatch.setattr(MainWindow, "_show_batch_summary", lambda self, summary: None)
+
+    queued._start_transcription()
+    deadline = time.monotonic() + 8.0
+    while queued.is_transcribing and time.monotonic() < deadline:
+        application.processEvents()
+        time.sleep(0.005)
+    application.processEvents()
+
+    assert RecordingWorker.captured, "the batch never reached the worker"
+    assert [job.source.name for job in RecordingWorker.captured[0]] == [
+        "d.mov",
+        "c.mov",
+        "a.mov",
+        "b.mov",
+    ]

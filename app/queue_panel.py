@@ -13,7 +13,14 @@ Drawing the line here keeps the feedback under our control and testable.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, Qt
+from PySide6.QtCore import (
+    QItemSelection,
+    QItemSelectionModel,
+    QPoint,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -28,13 +35,61 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-__all__ = ["QUEUE_COLUMNS", "QueuePanel"]
+__all__ = ["QUEUE_COLUMNS", "QueuePanel", "QueueTable"]
 
 #: The columns both queue views show, in order.
 QUEUE_COLUMNS = ("File", "Folder", "Duration", "Status")
 
 #: Height of the insertion line drawn while a row is being moved.
 INDICATOR_HEIGHT = 3
+
+
+class QueueTable(QTableWidget):
+    """A queue table that never edits its own rows.
+
+    ``QAbstractItemView.startDrag`` ends with::
+
+        if (drag->exec(supportedActions, defaultDropAction) == Qt::MoveAction)
+            d->clearOrRemove();
+
+    and ``clearOrRemove`` calls ``removeRows`` on whatever was selected. That
+    runs *after* the drop has been handled, so a row dragged to a new position
+    was reordered correctly and then deleted from the table it came from a
+    moment later: the clip vanished from the view while still sitting in the
+    window's queue. It only ever happened with a real mouse, because
+    ``drag->exec`` cannot return ``MoveAction`` without one.
+
+    So this table runs the drag itself and never calls up to that branch. The
+    window owns the queue and applies the move to its own list; the rows here
+    are only ever redrawn from it. ``drag_finished`` fires once the drag is
+    over, which is the moment Qt would have edited the rows, so the window can
+    confirm the views still match the queue.
+    """
+
+    #: Emitted when a drag that started here has ended, whatever its outcome.
+    drag_finished = Signal()
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt naming
+        """Run the drag without Qt's remove-the-source-rows epilogue."""
+        indexes = [
+            index
+            for index in self.selectedIndexes()
+            if index.flags() & Qt.ItemFlag.ItemIsDragEnabled
+        ]
+        if not indexes:
+            return
+        payload = self.model().mimeData(indexes)
+        if payload is None:
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(payload)
+        try:
+            # Copy, not Move, on both counts. Nothing here is being given
+            # away, and a Move result is the only thing Qt acts on.
+            drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        finally:
+            self.drag_finished.emit()
 
 
 class QueuePanel(QWidget):
@@ -54,7 +109,7 @@ class QueuePanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        self.table = QTableWidget(0, len(QUEUE_COLUMNS), self)
+        self.table = QueueTable(0, len(QUEUE_COLUMNS), self)
         self.table.setMinimumHeight(90)
         self.table.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -76,7 +131,10 @@ class QueuePanel(QWidget):
         self.table.setDragEnabled(True)
         self.table.setDragDropOverwriteMode(False)
         self.table.setDropIndicatorShown(False)
-        self.table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Move is what makes Qt delete the source rows once a drag ends.
+        # The window applies the reorder itself, so nothing is ever moved out
+        # of this table and the action stays Copy end to end.
+        self.table.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.table.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
 
         header = self.table.horizontalHeader()
